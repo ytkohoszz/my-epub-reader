@@ -37,6 +37,7 @@ import {
 const VIEW_TYPE = "my-epub-view";
 const MAX_CACHED_BOOKS = 15;
 const YAML_SYNC_DEBOUNCE_MS = 2000;
+const SELECTION_THROTTLE_MS = 120;
 
 type ThemeMode = "auto" | "sepia";
 type FontFamily = "default" | "serif" | "sans" | "mono";
@@ -44,9 +45,15 @@ type PageAnimation = "slide" | "fade" | "none";
 type BarPosition = "bottom" | "top";
 type SpreadMode = "none" | "auto";
 
-interface LocationCacheEntry {
+interface LegacyLocationCacheEntry {
   sig: string;
   locations: string;
+  updatedAt: number;
+}
+
+export interface LocationIndexMeta {
+  fileName: string;
+  sig: string;
   updatedAt: number;
 }
 
@@ -57,6 +64,7 @@ interface NavHistoryItem {
 
 export interface Settings {
   progress: Record<string, string>;
+  progressUpdatedAt?: Record<string, string>;
   fontSize: number;
   themeMode?: ThemeMode;
   fontFamily?: FontFamily;
@@ -65,7 +73,7 @@ export interface Settings {
   barPosition?: BarPosition;
   spreadMode?: SpreadMode;
   desktopWidthPct?: number;
-  locationsCache?: Record<string, LocationCacheEntry>;
+  locationsCache?: Record<string, LegacyLocationCacheEntry>;
   bookmarks?: Record<string, BookmarkItem[]>;
   booksFolder?: string;
   wordsFilePath?: string;
@@ -74,6 +82,7 @@ export interface Settings {
 
 const DEFAULTS: Settings = {
   progress: {},
+  progressUpdatedAt: {},
   fontSize: 120,
   themeMode: "auto",
   fontFamily: "serif",
@@ -82,7 +91,6 @@ const DEFAULTS: Settings = {
   barPosition: "bottom",
   spreadMode: "none",
   desktopWidthPct: 85,
-  locationsCache: {},
   bookmarks: {},
   booksFolder: "Знания/Книги",
   wordsFilePath: "Words Cards",
@@ -92,14 +100,24 @@ const DEFAULTS: Settings = {
 function migrateSettings(raw: any): Settings {
   const s: Settings = Object.assign({}, DEFAULTS, raw || {});
   if (!s.progress || typeof s.progress !== "object") s.progress = {};
+  if (!s.progressUpdatedAt || typeof s.progressUpdatedAt !== "object") s.progressUpdatedAt = {};
   if (typeof s.fontSize !== "number" || isNaN(s.fontSize)) s.fontSize = DEFAULTS.fontSize;
-  if (!s.locationsCache || typeof s.locationsCache !== "object") s.locationsCache = {};
   if (!s.bookmarks || typeof s.bookmarks !== "object") s.bookmarks = {};
   if (!s.booksFolder || typeof s.booksFolder !== "string") s.booksFolder = DEFAULTS.booksFolder;
   if (!s.wordsFilePath || typeof s.wordsFilePath !== "string") s.wordsFilePath = DEFAULTS.wordsFilePath;
   if (!s.quotesFilePath || typeof s.quotesFilePath !== "string") s.quotesFilePath = DEFAULTS.quotesFilePath;
   if (s.spreadMode !== "auto" && s.spreadMode !== "none") s.spreadMode = "none";
   return s;
+}
+
+function hashBookPathToFileName(bookPath: string): string {
+  let h = 2166136261;
+  for (let i = 0; i < bookPath.length; i++) {
+    h ^= bookPath.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  const hex = (h >>> 0).toString(16).padStart(8, "0");
+  return `loc-${hex}.json`;
 }
 
 const FONT_MAP: Record<FontFamily, string> = {
@@ -136,16 +154,23 @@ export class EpubView extends FileView {
   isFullscreen = false;
   lastGestureTime = 0;
 
+  // A1: флаг однократной подписки на события workspace за жизнь view
+  private workspaceEventsRegistered = false;
+
+  // A2: реестр всех таймеров выделения в iframe для гарантированной очистки
+  private selectionTimers = new Set<number>();
+
   stableCfi: string | null = null;
+  lastLocalPositionSavedAt: string | null = null;
   isResizing = false;
   isInitialLoadDone = false;
+  isGeneratingLocations = false;
   ExplicitCfiJumpPending = false;
   lastBoxWidth = 0;
   lastBoxHeight = 0;
   loadId = 0;
   cleanupListeners: Array<() => void> = [];
 
-  // Стек возврата со сносок, оглавления и быстрых переходов
   navHistory: NavHistoryItem[] = [];
 
   capturedWord = "";
@@ -164,6 +189,7 @@ export class EpubView extends FileView {
   currentPageNum: number | null = null;
   totalPagesNum: number | null = null;
   currentProgressPct: number | null = null;
+  approxProgressPct: number | null = null;
   chapterPageCurrent: number | null = null;
   chapterPageTotal: number | null = null;
   currentChapterTitle = "";
@@ -178,7 +204,24 @@ export class EpubView extends FileView {
   getDisplayText() { return this.file?.basename ?? "EPUB"; }
   canAcceptExtension(ext: string) { return ext === "epub"; }
 
+  async onOpen() {
+    await super.onOpen();
+    this.ensureWorkspaceEventsRegistered();
+  }
+
+  private ensureWorkspaceEventsRegistered() {
+    if (this.workspaceEventsRegistered) return;
+    this.workspaceEventsRegistered = true;
+    this.registerEvent(
+      this.app.workspace.on("css-change", () => this.applyStyles())
+    );
+    this.registerEvent(
+      this.app.workspace.on("active-leaf-change", () => this.plugin.syncGlobalBodyClasses())
+    );
+  }
+
   async onLoadFile(file: TFile) {
+    this.ensureWorkspaceEventsRegistered();
     await this.flushYamlProgress();
     this.cleanupView();
     const currentLoadId = ++this.loadId;
@@ -191,9 +234,9 @@ export class EpubView extends FileView {
     root.addClass("my-epub");
     root.setAttr("tabindex", "-1");
 
-    this.stableCfi = this.plugin.settings.progress[file.path] || null;
     this.isResizing = false;
     this.isInitialLoadDone = false;
+    this.isGeneratingLocations = false;
     this.lastBoxWidth = 0;
     this.lastBoxHeight = 0;
     this.navHistory = [];
@@ -211,17 +254,23 @@ export class EpubView extends FileView {
     this.currentPageNum = null;
     this.totalPagesNum = null;
     this.currentProgressPct = null;
+    this.approxProgressPct = null;
     this.chapterPageCurrent = null;
     this.chapterPageTotal = null;
     this.currentChapterTitle = "";
     this.pendingYamlSync = false;
+
+    // A3: сразу ищем привязанную заметку книги и выбираем более свежую стартовую позицию
+    this.trySilentResolveLinkedBookNote(file);
+    const initialPos = this.resolveInitialCfiBeforeRender(file);
+    this.stableCfi = initialPos.cfi;
+    this.lastLocalPositionSavedAt = initialPos.savedAt;
 
     this.wrapEl = root.createDiv("my-epub-wrap");
     this.boxEl = this.wrapEl.createDiv("my-epub-box");
     this.applyDesktopWidth(false);
     this.applySpreadClass();
 
-    // Плавающая капсула возврата после клика по сноске / переходу по оглавлению
     this.backPillEl = root.createDiv("my-epub-back-pill");
     this.backPillTextEl = this.backPillEl.createSpan({
       cls: "my-epub-back-pill-text",
@@ -244,7 +293,6 @@ export class EpubView extends FileView {
     };
     this.updateBackPillState();
 
-    // Мини-пульт для полноэкранного режима
     this.fsBarEl = root.createDiv("my-epub-fs-bar");
     const fsPrev = this.fsBarEl.createEl("button", { cls: "my-epub-fs-btn", text: "◀" });
     this.fsInfoEl = this.fsBarEl.createSpan({ cls: "my-epub-fs-info", text: "… · ⛶" });
@@ -270,7 +318,6 @@ export class EpubView extends FileView {
     this.bindActionButton(this.fsAddWordBtn, () => this.handleAddWordClick());
     this.bindActionButton(this.fsAddQuoteBtn, () => this.handleAddQuoteClick());
 
-    // Основная панель управления
     this.barEl = root.createDiv("my-epub-bar");
     this.applyBarPosition();
 
@@ -345,13 +392,6 @@ export class EpubView extends FileView {
       tocBtn.onclick = () => this.openToc();
       fontBtn.onclick = (e) => this.openTypographyMenu(e);
 
-      this.registerEvent(
-        this.app.workspace.on("css-change", () => this.applyStyles())
-      );
-      this.registerEvent(
-        this.app.workspace.on("active-leaf-change", () => this.plugin.syncGlobalBodyClasses())
-      );
-
       this.rendition.on("relocated", (loc: any) => this.onRelocated(file, loc));
 
       try {
@@ -380,9 +420,119 @@ export class EpubView extends FileView {
 
       this.trySilentResolveLinkedBookNote(file);
       await this.refreshBookHighlights();
+      if (currentLoadId !== this.loadId || !this.book || !this.rendition) return;
 
-      await this.loadOrGenerateLocations(file, currentLoadId);
-      if (currentLoadId !== this.loadId || !this.rendition) return;
+      // A4 + A5: пробуем мгновенно загрузить locations из файлового кэша плагина
+      const loadedFromCache = await this.tryLoadCachedLocations(file, currentLoadId);
+      if (currentLoadId !== this.loadId || !this.book || !this.rendition) return;
+
+      const cur: any = this.rendition.currentLocation();
+      if (cur?.start?.cfi) {
+        this.captureChapterMetricsFromLoc(cur);
+        this.stableCfi = cur.start.cfi;
+        this.updateProgressLabels(cur.start.cfi);
+      }
+
+      if (loadedFromCache) {
+        await this.reconcilePositionWithBookNote(file, currentLoadId);
+        if (currentLoadId !== this.loadId) return;
+        this.isInitialLoadDone = true;
+        this.ExplicitCfiJumpPending = false;
+        this.requestYamlProgressSync();
+      } else {
+        // A5: не блокируем UI — книга уже открыта и показывает примерный % через cfiFromPercentage / spine,
+        // а генерацию страниц запускаем в фоне с проверкой loadId
+        this.isGeneratingLocations = true;
+        if (this.stableCfi) this.updateProgressLabels(this.stableCfi);
+        void this.generateLocationsInBackground(file, currentLoadId);
+      }
+    } catch (err: any) {
+      if (currentLoadId !== this.loadId) return;
+      console.error("MyEpubPlugin error loading file:", err);
+      this.showError(file.name, err?.message || "Не удалось прочитать файл EPUB.");
+    }
+  }
+
+  // A3: предвыбор стартового CFI до рендера книги (сравнение времени YAML и data.json)
+  private resolveInitialCfiBeforeRender(file: TFile): { cfi: string | null; savedAt: string | null } {
+    const localCfi = this.plugin.settings.progress[file.path] || null;
+    const localTimeStr = this.plugin.settings.progressUpdatedAt?.[file.path] || null;
+
+    if (this.ExplicitCfiJumpPending || !this.linkedBookNote) {
+      return { cfi: localCfi, savedAt: localTimeStr };
+    }
+
+    const fm = this.app.metadataCache.getFileCache(this.linkedBookNote.file)?.frontmatter;
+    if (!fm) return { cfi: localCfi, savedAt: localTimeStr };
+
+    const rawYamlCfi = typeof fm["позиция"] === "string" ? fm["позиция"].trim() : "";
+    const yamlCfi = rawYamlCfi.startsWith("epubcfi(") ? rawYamlCfi : null;
+    const yamlTimeStr =
+      typeof fm["позиция_время"] === "string" && fm["позиция_время"].trim()
+        ? fm["позиция_время"].trim()
+        : null;
+
+    const rawPct = fm["прогресс"];
+    if (rawPct !== undefined && rawPct !== null && String(rawPct).trim() !== "") {
+      const n = Number(rawPct);
+      if (Number.isFinite(n) && n >= 0 && n <= 100) {
+        this.approxProgressPct = Math.round(n);
+      }
+    }
+
+    if (!yamlCfi) {
+      return { cfi: localCfi, savedAt: localTimeStr };
+    }
+
+    const yamlMs = yamlTimeStr ? Date.parse(yamlTimeStr) : NaN;
+    const localMs = localTimeStr ? Date.parse(localTimeStr) : NaN;
+
+    if (Number.isFinite(yamlMs) && Number.isFinite(localMs)) {
+      if (yamlMs > localMs) {
+        this.plugin.setLocalBookProgress(file.path, yamlCfi, yamlTimeStr!);
+        return { cfi: yamlCfi, savedAt: yamlTimeStr };
+      }
+      return { cfi: localCfi, savedAt: localTimeStr };
+    }
+
+    // Если времени нет хотя бы с одной стороны — приоритет у YAML
+    return { cfi: yamlCfi, savedAt: yamlTimeStr || localTimeStr };
+  }
+
+  // A4: чтение кэша страниц из отдельного файла в папке плагина
+  private async tryLoadCachedLocations(file: TFile, currentLoadId: number): Promise<boolean> {
+    if (!this.book) return false;
+    const sig = `${file.stat.mtime}:${file.stat.size}`;
+    const cachedJson = await this.plugin.loadLocationsCacheFile(file.path, sig);
+    if (currentLoadId !== this.loadId || !this.book || !cachedJson) return false;
+
+    try {
+      this.book.locations.load(cachedJson);
+      return this.book.locations.length() > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  // A5: неблокирующая фоновая генерация страниц с учётом loadId
+  private async generateLocationsInBackground(file: TFile, currentLoadId: number) {
+    if (!this.book) return;
+    const sig = `${file.stat.mtime}:${file.stat.size}`;
+    try {
+      await this.book.locations.generate(1024);
+      if (currentLoadId !== this.loadId || !this.book || !this.rendition) return;
+
+      this.isGeneratingLocations = false;
+      try {
+        const serialized = this.book.locations.save();
+        if (typeof serialized === "string" && serialized.length > 2) {
+          await this.plugin.saveLocationsCacheFile(file.path, sig, serialized);
+        }
+      } catch {
+        // Игнорируем ошибку записи кэша
+      }
+
+      if (currentLoadId !== this.loadId || !this.book || !this.rendition) return;
 
       const cur: any = this.rendition.currentLocation();
       if (cur?.start?.cfi) {
@@ -397,14 +547,48 @@ export class EpubView extends FileView {
       this.isInitialLoadDone = true;
       this.ExplicitCfiJumpPending = false;
       this.requestYamlProgressSync();
-    } catch (err: any) {
-      if (currentLoadId !== this.loadId) return;
-      console.error("MyEpubPlugin error loading file:", err);
-      this.showError(file.name, err?.message || "Не удалось прочитать файл EPUB.");
+    } catch {
+      if (currentLoadId === this.loadId) {
+        this.isGeneratingLocations = false;
+      }
     }
   }
 
-  // Сохраняет текущую позицию в стек возврата перед прыжком по сноске / оглавлению
+  // A5: оценка процента через cfiFromPercentage / spine, пока locations.generate ещё идёт
+  private computeFastPercentage(cfi: string, loc?: any): number {
+    if (!this.book) return this.approxProgressPct ?? 0;
+
+    if (this.book.locations && this.book.locations.length() > 0) {
+      const p = this.book.locations.percentageFromCfi(cfi);
+      if (typeof p === "number" && Number.isFinite(p)) {
+        return Math.max(0, Math.min(100, Math.round(p * 100)));
+      }
+    }
+
+    const start = loc?.start ?? (this.rendition?.currentLocation() as any)?.start;
+    const spineItems: any[] | undefined = (this.book.spine as any)?.spineItems;
+    const spineLen = spineItems?.length || 0;
+
+    if (start && typeof start.index === "number" && spineLen > 0) {
+      const dispPage = start.displayed?.page ?? 1;
+      const dispTotal = Math.max(1, start.displayed?.total ?? 1);
+      const frac = (start.index + (dispPage - 1) / dispTotal) / spineLen;
+      const pct = Math.max(0, Math.min(100, Math.round(frac * 100)));
+      // Проверяем cfiFromPercentage, если epubjs поддерживает его для текущего состояния
+      try {
+        if (typeof this.book.locations?.cfiFromPercentage === "function" && this.book.locations.length() > 0) {
+          void this.book.locations.cfiFromPercentage(pct / 100);
+        }
+      } catch {
+        // Игнорируем
+      }
+      this.approxProgressPct = pct;
+      return pct;
+    }
+
+    return this.approxProgressPct ?? 0;
+  }
+
   pushNavHistory() {
     if (!this.stableCfi || !this.currentPageNum) return;
     const last = this.navHistory[this.navHistory.length - 1];
@@ -444,6 +628,8 @@ export class EpubView extends FileView {
       this.chapterPageCurrent = null;
       this.chapterPageTotal = null;
     }
+
+    this.computeFastPercentage(loc?.start?.cfi || "", loc);
 
     const href: string = loc?.start?.href || "";
     if (href && this.book?.navigation?.toc) {
@@ -521,7 +707,7 @@ export class EpubView extends FileView {
     if (!this.plugin.settings.bookmarks) this.plugin.settings.bookmarks = {};
     const list = this.plugin.settings.bookmarks[this.file.path] ?? [];
     const page = this.currentPageNum ?? 1;
-    const pct = this.currentProgressPct ?? 0;
+    const pct = this.currentProgressPct ?? this.approxProgressPct ?? 0;
 
     const existingIdx = list.findIndex((b) => b.page === page || b.cfi === this.stableCfi);
     if (existingIdx !== -1) {
@@ -555,6 +741,7 @@ export class EpubView extends FileView {
     return list;
   }
 
+  // A3: сверка локальной позиции и YAML заметки книги по метке времени (позиция_время vs progressUpdatedAt)
   async reconcilePositionWithBookNote(file: TFile, currentLoadId: number) {
     if (this.ExplicitCfiJumpPending) return;
     if (!this.linkedBookNote || !this.book || !this.rendition) return;
@@ -563,23 +750,95 @@ export class EpubView extends FileView {
     const fm = this.app.metadataCache.getFileCache(this.linkedBookNote.file)?.frontmatter;
     if (!fm) return;
 
+    const rawYamlCfi = typeof fm["позиция"] === "string" ? fm["позиция"].trim() : "";
+    const yamlCfi = rawYamlCfi.startsWith("epubcfi(") ? rawYamlCfi : null;
+    const yamlTimeStr =
+      typeof fm["позиция_время"] === "string" && fm["позиция_время"].trim()
+        ? fm["позиция_время"].trim()
+        : null;
+
     const rawYamlRead = fm["прочитано"];
-    if (rawYamlRead === undefined || rawYamlRead === null || String(rawYamlRead).trim() === "") {
+    const hasYamlRead =
+      rawYamlRead !== undefined && rawYamlRead !== null && String(rawYamlRead).trim() !== "";
+    const parsedYamlPage = hasYamlRead ? Math.round(Number(rawYamlRead)) : NaN;
+    const yamlPage =
+      Number.isFinite(parsedYamlPage) && parsedYamlPage > 0
+        ? Math.max(1, Math.min(this.totalPagesNum, parsedYamlPage))
+        : null;
+
+    const localTimeStr =
+      this.lastLocalPositionSavedAt || this.plugin.settings.progressUpdatedAt?.[file.path] || null;
+    const yamlMs = yamlTimeStr ? Date.parse(yamlTimeStr) : NaN;
+    const localMs = localTimeStr ? Date.parse(localTimeStr) : NaN;
+    const hasBothTimes = Number.isFinite(yamlMs) && Number.isFinite(localMs);
+
+    const localPage = this.currentPageNum ?? 1;
+
+    const pickTargetCfiFromYaml = (): string | null => {
+      if (yamlCfi) {
+        if (yamlPage !== null) {
+          const cfiIdx = Number(this.book!.locations.locationFromCfi(yamlCfi));
+          const cfiPage = Math.max(1, Math.min(this.totalPagesNum!, cfiIdx + 1));
+          // Если в дашборде вручную изменили `прочитано`, переходим к указанной странице
+          if (Math.abs(cfiPage - yamlPage) >= 1) {
+            return this.getCfiFromPageNumber(yamlPage);
+          }
+        }
+        return yamlCfi;
+      }
+      if (yamlPage !== null) {
+        return this.getCfiFromPageNumber(yamlPage);
+      }
+      return null;
+    };
+
+    if (hasBothTimes) {
+      // Оба времени известны — побеждает более свежая запись
+      if (localMs > yamlMs) {
+        return;
+      }
+      if (yamlMs > localMs) {
+        const targetCfi = pickTargetCfiFromYaml();
+        if (targetCfi && targetCfi !== this.stableCfi && currentLoadId === this.loadId) {
+          this.stableCfi = targetCfi;
+          this.lastLocalPositionSavedAt = yamlTimeStr;
+          this.plugin.setLocalBookProgress(file.path, targetCfi, yamlTimeStr!);
+          try {
+            await this.rendition.display(targetCfi);
+          } catch {
+            // Игнорируем
+          }
+          this.updateProgressLabels(targetCfi);
+        }
+        return;
+      }
+      // Если времена равны, но `прочитано` в YAML было изменено вручную в дашборде
+      if (yamlPage !== null && yamlPage !== localPage) {
+        const targetCfi = this.getCfiFromPageNumber(yamlPage);
+        if (targetCfi && currentLoadId === this.loadId) {
+          const nowIso = new Date().toISOString();
+          this.stableCfi = targetCfi;
+          this.lastLocalPositionSavedAt = nowIso;
+          this.plugin.setLocalBookProgress(file.path, targetCfi, nowIso);
+          try {
+            await this.rendition.display(targetCfi);
+          } catch {
+            // Игнорируем
+          }
+          this.updateProgressLabels(targetCfi);
+        }
+      }
       return;
     }
 
-    const yamlPage = Math.round(Number(rawYamlRead));
-    if (!Number.isFinite(yamlPage) || yamlPage <= 0) return;
-
-    const clampedYamlPage = Math.max(1, Math.min(this.totalPagesNum, yamlPage));
-    const localPage = this.currentPageNum ?? 1;
-
-    if (clampedYamlPage !== localPage) {
-      const targetCfi = this.getCfiFromPageNumber(clampedYamlPage);
+    // Если времени нет хотя бы с одной стороны — поведение прежнее (YAML приоритетнее)
+    if (yamlPage !== null && yamlPage !== localPage) {
+      const targetCfi = pickTargetCfiFromYaml();
       if (targetCfi && currentLoadId === this.loadId) {
+        const syncedTime = yamlTimeStr || new Date().toISOString();
         this.stableCfi = targetCfi;
-        this.plugin.settings.progress[file.path] = targetCfi;
-        this.plugin.requestSaveSettings();
+        this.lastLocalPositionSavedAt = syncedTime;
+        this.plugin.setLocalBookProgress(file.path, targetCfi, syncedTime);
         try {
           await this.rendition.display(targetCfi);
         } catch {
@@ -587,6 +846,17 @@ export class EpubView extends FileView {
         }
         this.updateProgressLabels(targetCfi);
       }
+    } else if (yamlCfi && yamlCfi !== this.stableCfi && !this.stableCfi) {
+      const syncedTime = yamlTimeStr || new Date().toISOString();
+      this.stableCfi = yamlCfi;
+      this.lastLocalPositionSavedAt = syncedTime;
+      this.plugin.setLocalBookProgress(file.path, yamlCfi, syncedTime);
+      try {
+        await this.rendition.display(yamlCfi);
+      } catch {
+        // Игнорируем
+      }
+      this.updateProgressLabels(yamlCfi);
     }
   }
 
@@ -629,7 +899,11 @@ export class EpubView extends FileView {
   }
 
   openJumpModal() {
-    if (!this.book || !this.totalPagesNum || this.totalPagesNum <= 0) return;
+    if (!this.book) return;
+    if (!this.totalPagesNum || this.totalPagesNum <= 0) {
+      new Notice("Страницы ещё считаются — подожди пару секунд.");
+      return;
+    }
     this.prepareMainWindowFocusBeforeModal();
     const curPage = this.currentPageNum ?? 1;
     new JumpToPageModal(
@@ -651,11 +925,12 @@ export class EpubView extends FileView {
     if (!cfi) return;
     if (recordHistory) this.pushNavHistory();
     const navCfi = cfi.includes(",") ? cfi.replace(/,[^,)]+\)$/, ")") : cfi;
+    const nowIso = new Date().toISOString();
     this.ExplicitCfiJumpPending = true;
     this.stableCfi = navCfi;
+    this.lastLocalPositionSavedAt = nowIso;
     if (this.file) {
-      this.plugin.settings.progress[this.file.path] = navCfi;
-      this.plugin.requestSaveSettings();
+      this.plugin.setLocalBookProgress(this.file.path, navCfi, nowIso);
     }
     if (this.rendition) {
       this.isResizing = false;
@@ -800,12 +1075,10 @@ export class EpubView extends FileView {
 
   requestYamlProgressSync() {
     if (!this.isInitialLoadDone) return;
-    // Если пользователь перешёл по сноске в конец книги и плашка «↩ Назад» активна —
-    // не перезаписываем прогресс в YAML заметки книги, пока он не вернётся или не закроет плашку
     if (this.navHistory.length > 0) return;
     if (!this.linkedBookNote || !this.file) return;
     if (this.linkedBookNote.linkedEpubPath !== this.file.path) return;
-    if (this.totalPagesNum === null || this.totalPagesNum <= 0 || this.currentPageNum === null) return;
+    if (!this.stableCfi) return;
 
     this.pendingYamlSync = true;
     if (this.yamlSyncTimer) window.clearTimeout(this.yamlSyncTimer);
@@ -815,6 +1088,7 @@ export class EpubView extends FileView {
     }, YAML_SYNC_DEBOUNCE_MS);
   }
 
+  // A3: запись прогресса, `позиция` (epubcfi) и `позиция_время` (ISO-строка) в YAML заметки книги
   async flushYamlProgress() {
     if (this.yamlSyncTimer) {
       window.clearTimeout(this.yamlSyncTimer);
@@ -827,29 +1101,38 @@ export class EpubView extends FileView {
     const noteFile = this.linkedBookNote.file;
     const pageNum = this.currentPageNum;
     const totalNum = this.totalPagesNum;
-    const pctNum = this.currentProgressPct;
+    const pctNum = this.currentProgressPct ?? this.approxProgressPct;
+    const cfiToSync = this.stableCfi;
+    const posTimeIso =
+      this.lastLocalPositionSavedAt ||
+      this.plugin.settings.progressUpdatedAt?.[this.file.path] ||
+      new Date().toISOString();
 
-    if (totalNum === null || totalNum <= 0 || pageNum === null || pctNum === null) return;
+    if (!cfiToSync) return;
     this.pendingYamlSync = false;
 
     const todayISO = getTodayISO();
     const fmCache = this.app.metadataCache.getFileCache(noteFile)?.frontmatter;
     if (
       fmCache &&
-      fmCache["страниц"] === totalNum &&
-      fmCache["прочитано"] === pageNum &&
-      fmCache["прогресс"] === pctNum &&
-      fmCache["последнее_чтение"] === todayISO
+      (totalNum === null || fmCache["страниц"] === totalNum) &&
+      (pageNum === null || fmCache["прочитано"] === pageNum) &&
+      (pctNum === null || fmCache["прогресс"] === pctNum) &&
+      fmCache["последнее_чтение"] === todayISO &&
+      fmCache["позиция"] === cfiToSync &&
+      fmCache["позиция_время"] === posTimeIso
     ) {
       return;
     }
 
     try {
       await this.app.fileManager.processFrontMatter(noteFile, (fm) => {
-        fm["страниц"] = totalNum;
-        fm["прочитано"] = pageNum;
-        fm["прогресс"] = pctNum;
+        if (totalNum !== null && totalNum > 0) fm["страниц"] = totalNum;
+        if (pageNum !== null && pageNum > 0) fm["прочитано"] = pageNum;
+        if (pctNum !== null && pctNum >= 0) fm["прогресс"] = pctNum;
         fm["последнее_чтение"] = todayISO;
+        fm["позиция"] = cfiToSync;
+        fm["позиция_время"] = posTimeIso;
         if (!fm["статус"] || fm["статус"] === "В планах") {
           fm["статус"] = "Читаю";
         }
@@ -991,58 +1274,6 @@ export class EpubView extends FileView {
     });
   }
 
-  async loadOrGenerateLocations(file: TFile, currentLoadId: number) {
-    if (!this.book) return;
-    const sig = `${file.stat.mtime}:${file.stat.size}`;
-    const cache = this.plugin.settings.locationsCache ?? {};
-    const entry = cache[file.path];
-
-    if (entry && entry.sig === sig && entry.locations) {
-      try {
-        this.book.locations.load(entry.locations);
-        entry.updatedAt = Date.now();
-        return;
-      } catch {
-        // Пересчитаем заново
-      }
-    }
-
-    this.info?.setText("…");
-    await this.book.locations.generate(1024);
-    if (currentLoadId !== this.loadId || !this.book) return;
-
-    try {
-      const serialized = this.book.locations.save();
-      if (typeof serialized === "string" && serialized.length > 2) {
-        if (!this.plugin.settings.locationsCache) {
-          this.plugin.settings.locationsCache = {};
-        }
-        this.plugin.settings.locationsCache[file.path] = {
-          sig,
-          locations: serialized,
-          updatedAt: Date.now(),
-        };
-        this.pruneLocationsCache();
-        this.plugin.requestSaveSettings();
-      }
-    } catch {
-      // Игнорируем
-    }
-  }
-
-  pruneLocationsCache() {
-    const cache = this.plugin.settings.locationsCache;
-    if (!cache) return;
-    const keys = Object.keys(cache);
-    if (keys.length <= MAX_CACHED_BOOKS) return;
-
-    keys.sort((a, b) => (cache[a]?.updatedAt ?? 0) - (cache[b]?.updatedAt ?? 0));
-    const toRemove = keys.slice(0, keys.length - MAX_CACHED_BOOKS);
-    for (const k of toRemove) {
-      delete cache[k];
-    }
-  }
-
   showError(fileName: string, details: string) {
     if (!this.boxEl) return;
     this.boxEl.empty();
@@ -1107,6 +1338,15 @@ export class EpubView extends FileView {
     }
   }
 
+  private scheduleSelectionTimer(fn: () => void, ms: number): number {
+    const id = window.setTimeout(() => {
+      this.selectionTimers.delete(id);
+      fn();
+    }, ms);
+    this.selectionTimers.add(id);
+    return id;
+  }
+
   setupGesturesAndSelection() {
     if (!this.rendition) return;
 
@@ -1127,7 +1367,6 @@ export class EpubView extends FileView {
       const win: Window | undefined = contents?.window;
       if (!doc) return;
 
-      // Применяем тему сразу при загрузке новой главы без белой вспышки
       this.applyStyles();
       this.attachTouchHandlers(doc, true, contents);
       this.attachInternalLinkInterceptor(doc);
@@ -1144,18 +1383,52 @@ export class EpubView extends FileView {
         }
       };
 
-      doc.addEventListener("selectionchange", checkIframeSelection);
-      win?.addEventListener?.("selectionchange", checkIframeSelection);
-      doc.addEventListener(
-        "touchend",
-        () => {
-          window.setTimeout(checkIframeSelection, 30);
-          window.setTimeout(checkIframeSelection, 180);
-        },
-        { passive: true }
-      );
-      doc.addEventListener("mouseup", () => {
-        window.setTimeout(checkIframeSelection, 20);
+      // A2: throttle ~120 мс для selectionchange без дублирующего слушателя на window
+      let lastSelCheckTime = 0;
+      let selThrottleTimer: number | null = null;
+
+      const onThrottledSelectionChange = () => {
+        const now = Date.now();
+        const elapsed = now - lastSelCheckTime;
+        if (elapsed >= SELECTION_THROTTLE_MS) {
+          if (selThrottleTimer !== null) {
+            window.clearTimeout(selThrottleTimer);
+            this.selectionTimers.delete(selThrottleTimer);
+            selThrottleTimer = null;
+          }
+          lastSelCheckTime = now;
+          checkIframeSelection();
+        } else if (selThrottleTimer === null) {
+          selThrottleTimer = this.scheduleSelectionTimer(() => {
+            selThrottleTimer = null;
+            lastSelCheckTime = Date.now();
+            checkIframeSelection();
+          }, SELECTION_THROTTLE_MS - elapsed);
+        }
+      };
+
+      const onDocTouchEnd = () => {
+        this.scheduleSelectionTimer(checkIframeSelection, 30);
+        this.scheduleSelectionTimer(checkIframeSelection, 180);
+      };
+
+      const onDocMouseUp = () => {
+        this.scheduleSelectionTimer(checkIframeSelection, 20);
+      };
+
+      doc.addEventListener("selectionchange", onThrottledSelectionChange);
+      doc.addEventListener("touchend", onDocTouchEnd, { passive: true });
+      doc.addEventListener("mouseup", onDocMouseUp);
+
+      this.cleanupListeners.push(() => {
+        if (selThrottleTimer !== null) {
+          window.clearTimeout(selThrottleTimer);
+          this.selectionTimers.delete(selThrottleTimer);
+          selThrottleTimer = null;
+        }
+        doc.removeEventListener("selectionchange", onThrottledSelectionChange);
+        doc.removeEventListener("touchend", onDocTouchEnd);
+        doc.removeEventListener("mouseup", onDocMouseUp);
       });
     });
 
@@ -1170,7 +1443,6 @@ export class EpubView extends FileView {
     });
   }
 
-  // Перехватывает клики по сноскам [1] и внешним ссылкам внутри iframe книги
   attachInternalLinkInterceptor(doc: Document) {
     doc.addEventListener(
       "click",
@@ -1182,7 +1454,6 @@ export class EpubView extends FileView {
         const rawHref = anchor.getAttribute("href")?.trim() || "";
         if (!rawHref) return;
 
-        // 1. Внешние веб-ссылки открываем в системном браузере, чтобы не ломать iframe читалки
         if (/^(https?:|mailto:|tel:)/i.test(rawHref)) {
           ev.preventDefault();
           ev.stopPropagation();
@@ -1190,8 +1461,6 @@ export class EpubView extends FileView {
           return;
         }
 
-        // 2. Внутренние ссылки книги (сноски, примечания, ссылки на главы) —
-        // запоминаем текущую страницу в стек возврата `↩ Назад к стр. N`
         this.pushNavHistory();
       },
       { capture: true }
@@ -1364,7 +1633,7 @@ export class EpubView extends FileView {
       quotes: this.bookQuotes,
       currentChapterLabel: this.currentChapterTitle || this.bookTitleMeta,
       currentPage: this.currentPageNum,
-      currentPct: this.currentProgressPct,
+      currentPct: this.currentProgressPct ?? this.approxProgressPct,
       onSelectToc: (href) => {
         this.pushNavHistory();
         this.isResizing = false;
@@ -1548,9 +1817,12 @@ export class EpubView extends FileView {
   }
 
   isCurrentPageBookmarked(): boolean {
-    if (!this.file || !this.currentPageNum) return false;
+    if (!this.file) return false;
     const list = this.plugin.settings.bookmarks?.[this.file.path] ?? [];
-    return list.some((b) => b.page === this.currentPageNum);
+    if (this.currentPageNum) {
+      return list.some((b) => b.page === this.currentPageNum);
+    }
+    return Boolean(this.stableCfi && list.some((b) => b.cfi === this.stableCfi));
   }
 
   triggerResize(force = false) {
@@ -1754,32 +2026,38 @@ export class EpubView extends FileView {
   updateProgressLabels(cfi: string) {
     if (!this.book) return;
     const total = this.book.locations.length();
+    const bmMark = this.isCurrentPageBookmarked() ? "🔖 " : "";
+    let chapterLeftSuffix = "";
+    if (this.chapterPageCurrent !== null && this.chapterPageTotal !== null) {
+      const left = Math.max(0, this.chapterPageTotal - this.chapterPageCurrent);
+      chapterLeftSuffix = left === 0 ? " · конец гл." : ` · гл.: ост. ${left} стр.`;
+    }
+
+    const summary = this.getChapterSummaryText();
+    if (summary) {
+      this.info.setAttr("title", `${summary}. Нажми для быстрого перехода.`);
+    }
+
     if (total > 0) {
       const idx = Number(this.book.locations.locationFromCfi(cfi));
       const page = Math.max(1, Math.min(total, idx + 1));
-      const pct = Math.max(0, Math.min(100, Math.round(this.book.locations.percentageFromCfi(cfi) * 100)));
+      const pct = Math.max(
+        0,
+        Math.min(100, Math.round(this.book.locations.percentageFromCfi(cfi) * 100))
+      );
 
       this.currentPageNum = page;
       this.totalPagesNum = total;
       this.currentProgressPct = pct;
-
-      const bmMark = this.isCurrentPageBookmarked() ? "🔖 " : "";
-      let chapterLeftSuffix = "";
-      if (this.chapterPageCurrent !== null && this.chapterPageTotal !== null) {
-        const left = Math.max(0, this.chapterPageTotal - this.chapterPageCurrent);
-        chapterLeftSuffix = left === 0 ? " · конец гл." : ` · гл.: ост. ${left} стр.`;
-      }
-
-      const summary = this.getChapterSummaryText();
-      if (summary) {
-        this.info.setAttr("title", `${summary}. Нажми для быстрого перехода.`);
-      }
+      this.approxProgressPct = pct;
 
       this.info.setText(`${bmMark}стр. ${page} / ${total} · ${pct}%${chapterLeftSuffix}`);
       this.fsInfoEl?.setText(`${bmMark}${page}/${total} · ${pct}% ⛶`);
     } else {
-      this.info.setText("…");
-      this.fsInfoEl?.setText("… ⛶");
+      // A5: пока locations.generate ещё считается, сразу показываем процент без блокировки UI
+      const fastPct = this.computeFastPercentage(cfi);
+      this.info.setText(`${bmMark}~${fastPct}%${chapterLeftSuffix} · считаю стр.…`);
+      this.fsInfoEl?.setText(`${bmMark}~${fastPct}% ⛶`);
     }
   }
 
@@ -1796,8 +2074,16 @@ export class EpubView extends FileView {
 
     this.captureChapterMetricsFromLoc(loc);
     this.stableCfi = cfi;
-    this.plugin.settings.progress[file.path] = cfi;
-    this.plugin.requestSaveSettings();
+
+    if (this.isInitialLoadDone) {
+      const nowIso = new Date().toISOString();
+      this.lastLocalPositionSavedAt = nowIso;
+      this.plugin.setLocalBookProgress(file.path, cfi, nowIso);
+    } else {
+      this.plugin.settings.progress[file.path] = cfi;
+      this.plugin.requestSaveSettings();
+    }
+
     this.updateProgressLabels(cfi);
     this.requestYamlProgressSync();
   }
@@ -1806,6 +2092,7 @@ export class EpubView extends FileView {
     this.loadId++;
     this.isFullscreen = false;
     this.isInitialLoadDone = false;
+    this.isGeneratingLocations = false;
     this.navHistory = [];
     this.plugin.syncGlobalBodyClasses();
     if (this.resizeTimer) {
@@ -1816,6 +2103,10 @@ export class EpubView extends FileView {
       window.clearTimeout(this.animTimer);
       this.animTimer = null;
     }
+    for (const timerId of this.selectionTimers) {
+      window.clearTimeout(timerId);
+    }
+    this.selectionTimers.clear();
     for (const fn of this.cleanupListeners) {
       try { fn(); } catch { /* ignore */ }
     }
@@ -1954,16 +2245,17 @@ class EpubSettingTab extends PluginSettingTab {
           })
       );
 
-    const cacheCount = Object.keys(this.plugin.settings.locationsCache ?? {}).length;
+    const cacheCount = this.plugin.getCachedBooksCount();
     new Setting(containerEl)
       .setName("Кэш номеров страниц")
-      .setDesc(`Сохранено книг в кэше: ${cacheCount} (макс. ${MAX_CACHED_BOOKS}). Ускоряет повторное открытие книг.`)
+      .setDesc(
+        `Сохранено книг в отдельных файлах плагина: ${cacheCount} (макс. ${MAX_CACHED_BOOKS}). Ускоряет повторное открытие книг.`
+      )
       .addButton((btn) =>
         btn
           .setButtonText("Очистить кэш")
           .onClick(async () => {
-            this.plugin.settings.locationsCache = {};
-            await this.plugin.flushSaveSettings();
+            await this.plugin.clearAllLocationsCacheFiles();
             new Notice("Кэш страниц очищен");
             this.display();
           })
@@ -1975,9 +2267,12 @@ export default class MyEpubPlugin extends Plugin {
   settings!: Settings;
   private saveTimer: number | null = null;
   private dirty = false;
+  private locationsIndex: Record<string, LocationIndexMeta> = {};
 
   async onload() {
     this.settings = migrateSettings(await this.loadData());
+    await this.initAndMigrateLocationsCache();
+
     this.registerView(VIEW_TYPE, (leaf) => new EpubView(leaf, this));
     this.registerExtensions(["epub"], VIEW_TYPE);
     this.addSettingTab(new EpubSettingTab(this.app, this));
@@ -1994,6 +2289,62 @@ export default class MyEpubPlugin extends Plugin {
       if (fileParam) {
         await this.openEpubAt(fileParam, cfiParam || undefined);
       }
+    });
+
+    // A6: команды палитры через addCommand с checkCallback (только при активном EpubView)
+    this.addCommand({
+      id: "next-page",
+      name: "Следующая страница",
+      checkCallback: (checking: boolean) => {
+        const view = this.app.workspace.getActiveViewOfType(EpubView);
+        if (!view) return false;
+        if (!checking) view.turnPage("next");
+        return true;
+      },
+    });
+
+    this.addCommand({
+      id: "prev-page",
+      name: "Предыдущая страница",
+      checkCallback: (checking: boolean) => {
+        const view = this.app.workspace.getActiveViewOfType(EpubView);
+        if (!view) return false;
+        if (!checking) view.turnPage("prev");
+        return true;
+      },
+    });
+
+    this.addCommand({
+      id: "toggle-book-page-bookmark",
+      name: "Добавить или удалить закладку на текущей странице",
+      checkCallback: (checking: boolean) => {
+        const view = this.app.workspace.getActiveViewOfType(EpubView);
+        if (!view) return false;
+        if (!checking) view.toggleBookmarkOnCurrentPage();
+        return true;
+      },
+    });
+
+    this.addCommand({
+      id: "open-table-of-contents",
+      name: "Открыть оглавление, закладки и выписанные слова",
+      checkCallback: (checking: boolean) => {
+        const view = this.app.workspace.getActiveViewOfType(EpubView);
+        if (!view) return false;
+        if (!checking) void view.openToc();
+        return true;
+      },
+    });
+
+    this.addCommand({
+      id: "jump-to-book-page",
+      name: "Перейти к странице или проценту книги",
+      checkCallback: (checking: boolean) => {
+        const view = this.app.workspace.getActiveViewOfType(EpubView);
+        if (!view) return false;
+        if (!checking) view.openJumpModal();
+        return true;
+      },
     });
 
     this.addCommand({
@@ -2030,28 +2381,6 @@ export default class MyEpubPlugin extends Plugin {
     });
 
     this.addCommand({
-      id: "toggle-book-page-bookmark",
-      name: "Добавить или удалить закладку на текущей странице",
-      checkCallback: (checking: boolean) => {
-        const view = this.app.workspace.getActiveViewOfType(EpubView);
-        if (!view) return false;
-        if (!checking) view.toggleBookmarkOnCurrentPage();
-        return true;
-      },
-    });
-
-    this.addCommand({
-      id: "jump-to-book-page",
-      name: "Перейти к странице или проценту книги",
-      checkCallback: (checking: boolean) => {
-        const view = this.app.workspace.getActiveViewOfType(EpubView);
-        if (!view) return false;
-        if (!checking) view.openJumpModal();
-        return true;
-      },
-    });
-
-    this.addCommand({
       id: "link-or-create-book-note",
       name: "Привязать или создать заметку книги",
       checkCallback: (checking: boolean) => {
@@ -2061,6 +2390,175 @@ export default class MyEpubPlugin extends Plugin {
         return true;
       },
     });
+  }
+
+  getPluginDir(): string {
+    return this.manifest.dir || `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
+  }
+
+  private getLocationsIndexPath(): string {
+    return `${this.getPluginDir()}/locations-index.json`;
+  }
+
+  getCachedBooksCount(): number {
+    return Object.keys(this.locationsIndex).length;
+  }
+
+  // A4: инициализация индекса и миграция старого locationsCache из data.json в отдельные файлы
+  async initAndMigrateLocationsCache() {
+    const adapter = this.app.vault.adapter;
+    const indexPath = this.getLocationsIndexPath();
+
+    try {
+      if (await adapter.exists(indexPath)) {
+        const raw = await adapter.read(indexPath);
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === "object") {
+          this.locationsIndex = parsed;
+        }
+      }
+    } catch {
+      this.locationsIndex = {};
+    }
+
+    const legacy = this.settings.locationsCache;
+    if (legacy && typeof legacy === "object" && Object.keys(legacy).length > 0) {
+      const pluginDir = this.getPluginDir();
+      for (const [bookPath, entry] of Object.entries(legacy)) {
+        if (
+          entry &&
+          typeof entry.sig === "string" &&
+          typeof entry.locations === "string" &&
+          entry.locations.length > 2
+        ) {
+          const fileName = hashBookPathToFileName(bookPath);
+          const filePath = `${pluginDir}/${fileName}`;
+          try {
+            await adapter.write(filePath, entry.locations);
+            this.locationsIndex[bookPath] = {
+              fileName,
+              sig: entry.sig,
+              updatedAt: entry.updatedAt || Date.now(),
+            };
+          } catch {
+            // Игнорируем ошибку переноса отдельного файла
+          }
+        }
+      }
+      delete this.settings.locationsCache;
+      await this.pruneLocationsCacheFiles();
+      await this.saveLocationsIndexToDisk();
+      await this.saveData(this.settings);
+    } else if ("locationsCache" in this.settings) {
+      delete this.settings.locationsCache;
+      await this.saveData(this.settings);
+    }
+  }
+
+  private async saveLocationsIndexToDisk() {
+    try {
+      await this.app.vault.adapter.write(
+        this.getLocationsIndexPath(),
+        JSON.stringify(this.locationsIndex)
+      );
+    } catch {
+      // Игнорируем
+    }
+  }
+
+  async loadLocationsCacheFile(bookPath: string, expectedSig: string): Promise<string | null> {
+    const meta = this.locationsIndex[bookPath];
+    if (!meta || meta.sig !== expectedSig || !meta.fileName) return null;
+
+    const fullPath = `${this.getPluginDir()}/${meta.fileName}`;
+    try {
+      const adapter = this.app.vault.adapter;
+      if (!(await adapter.exists(fullPath))) return null;
+      const content = await adapter.read(fullPath);
+      if (!content || content.length <= 2) return null;
+      meta.updatedAt = Date.now();
+      void this.saveLocationsIndexToDisk();
+      return content;
+    } catch {
+      return null;
+    }
+  }
+
+  async saveLocationsCacheFile(bookPath: string, sig: string, serializedLocations: string) {
+    const fileName = hashBookPathToFileName(bookPath);
+    const fullPath = `${this.getPluginDir()}/${fileName}`;
+    try {
+      await this.app.vault.adapter.write(fullPath, serializedLocations);
+      this.locationsIndex[bookPath] = {
+        fileName,
+        sig,
+        updatedAt: Date.now(),
+      };
+      await this.pruneLocationsCacheFiles();
+      await this.saveLocationsIndexToDisk();
+    } catch {
+      // Игнорируем
+    }
+  }
+
+  private async pruneLocationsCacheFiles() {
+    const keys = Object.keys(this.locationsIndex);
+    if (keys.length <= MAX_CACHED_BOOKS) return;
+
+    keys.sort(
+      (a, b) =>
+        (this.locationsIndex[a]?.updatedAt ?? 0) - (this.locationsIndex[b]?.updatedAt ?? 0)
+    );
+    const toRemove = keys.slice(0, keys.length - MAX_CACHED_BOOKS);
+    const adapter = this.app.vault.adapter;
+    const pluginDir = this.getPluginDir();
+
+    for (const k of toRemove) {
+      const meta = this.locationsIndex[k];
+      delete this.locationsIndex[k];
+      if (meta?.fileName) {
+        const fullPath = `${pluginDir}/${meta.fileName}`;
+        try {
+          if (await adapter.exists(fullPath)) {
+            await adapter.remove(fullPath);
+          }
+        } catch {
+          // Игнорируем
+        }
+      }
+    }
+  }
+
+  async clearAllLocationsCacheFiles() {
+    const adapter = this.app.vault.adapter;
+    const pluginDir = this.getPluginDir();
+    for (const meta of Object.values(this.locationsIndex)) {
+      if (meta?.fileName) {
+        const fullPath = `${pluginDir}/${meta.fileName}`;
+        try {
+          if (await adapter.exists(fullPath)) {
+            await adapter.remove(fullPath);
+          }
+        } catch {
+          // Игнорируем
+        }
+      }
+    }
+    this.locationsIndex = {};
+    await this.saveLocationsIndexToDisk();
+    if ("locationsCache" in this.settings) {
+      delete this.settings.locationsCache;
+      await this.flushSaveSettings();
+    }
+  }
+
+  setLocalBookProgress(filePath: string, cfi: string, isoTime = new Date().toISOString()) {
+    this.settings.progress[filePath] = cfi;
+    if (!this.settings.progressUpdatedAt) {
+      this.settings.progressUpdatedAt = {};
+    }
+    this.settings.progressUpdatedAt[filePath] = isoTime;
+    this.requestSaveSettings();
   }
 
   async onExternalSettingsChange() {
@@ -2120,8 +2618,7 @@ export default class MyEpubPlugin extends Plugin {
 
     const navCfi = cfi && cfi.includes(",") ? cfi.replace(/,[^,)]+\)$/, ")") : cfi;
     if (navCfi) {
-      this.settings.progress[targetFile.path] = navCfi;
-      this.requestSaveSettings();
+      this.setLocalBookProgress(targetFile.path, navCfi, new Date().toISOString());
     }
 
     const existingLeaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
