@@ -761,3 +761,96 @@ body.my-epub-fullscreen .my-epub-wrap {
   border-radius: 8px;
   cursor: pointer;
 }
+/* Релиз C: Тема «Ночь», вкладка «🔍 Поиск» и эргономика iPad (44x44 px + safe-area) */
+.view-content.my-epub.my-epub-is-night,
+.my-epub.my-epub-is-night {
+  background-color: #121316 !important;
+}
+
+.my-epub.my-epub-is-night .my-epub-bar,
+.my-epub.my-epub-is-night .my-epub-fs-bar,
+.my-epub.my-epub-is-night .my-epub-back-pill,
+.my-epub.my-epub-is-night .my-epub-hl-card {
+  background: #1a1c20;
+  color: #c9ccd1;
+  border-color: #2c3038;
+}
+
+.my-epub.my-epub-is-night .my-epub-info,
+.my-epub.my-epub-is-night .my-epub-fs-info,
+.my-epub.my-epub-is-night .my-epub-hl-card-example {
+  color: #8b919a;
+}
+
+.my-epub.my-epub-is-night .my-epub-btn,
+.my-epub.my-epub-is-night .my-epub-fs-btn {
+  background: #23262d;
+  color: #c9ccd1;
+}
+
+.my-epub.my-epub-is-night .my-epub-hl-card-title,
+.my-epub.my-epub-is-night .my-epub-hl-card-body {
+  color: #e2e5ea;
+}
+
+body.my-epub-fullscreen.my-epub-night-bg,
+body.my-epub-fullscreen.my-epub-night-bg .app-container,
+body.my-epub-fullscreen.my-epub-night-bg .horizontal-main-container,
+body.my-epub-fullscreen.my-epub-night-bg .workspace,
+body.my-epub-fullscreen.my-epub-night-bg .workspace-split,
+body.my-epub-fullscreen.my-epub-night-bg .workspace-tabs,
+body.my-epub-fullscreen.my-epub-night-bg .workspace-leaf,
+body.my-epub-fullscreen.my-epub-night-bg .workspace-leaf-content {
+  background-color: #121316 !important;
+}
+
+/* Вкладка «🔍 Поиск» в BookNavModal */
+.my-epub-search-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin-bottom: 0.5rem;
+}
+
+.my-epub-search-input {
+  flex: 1;
+  margin-bottom: 0 !important;
+}
+
+.my-epub-search-status {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  margin-bottom: 0.5rem;
+  padding: 0 0.25rem;
+}
+
+.my-epub-search-chapter {
+  font-size: 0.75rem;
+  font-weight: 700;
+  color: var(--text-accent);
+  margin-bottom: 0.15rem;
+}
+
+/* C5: Учёт безопасных зон env(safe-area-inset-*) и минимальный размер кнопок 44x44 px на iPad */
+.my-epub-wrap {
+  padding-left: max(0.65rem, env(safe-area-inset-left, 0px));
+  padding-right: max(0.65rem, env(safe-area-inset-right, 0px));
+}
+
+.my-epub-bar {
+  padding-left: max(0.85rem, env(safe-area-inset-left, 0px));
+  padding-right: max(0.85rem, env(safe-area-inset-right, 0px));
+}
+
+@media (min-width: 601px) {
+  .my-epub-btn,
+  .my-epub-fs-btn,
+  .my-epub-nav-tab,
+  .my-epub-modal-btn,
+  .my-epub-bm-del,
+  .my-epub-hl-card-btn,
+  .my-epub-hl-card-close {
+    min-width: 44px;
+    min-height: 44px;
+  }
+}

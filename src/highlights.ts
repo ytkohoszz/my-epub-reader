@@ -1,5 +1,5 @@
 import { App, Modal, Notice, TFile } from "obsidian";
-import { NavItem, Rendition } from "epubjs";
+import { Book, NavItem, Rendition } from "epubjs";
 import {
   BookNoteInfo,
   EXAMPLE_SEP,
@@ -34,7 +34,14 @@ export interface BookQuoteEntry {
   lineNumber: number;
 }
 
-// Контекст последнего обновления аннотаций для перехода из всплывающей карточки в файл заметки
+interface BookSearchMatch {
+  cfi: string;
+  excerpt: string;
+  chapterLabel: string;
+}
+
+const MAX_SEARCH_RESULTS = 50;
+
 let activeAnnotationsApp: App | null = null;
 let activeWordsFilePath = "Words Cards";
 let activeQuotesFilePath = "Знания/Цитаты из книг.md";
@@ -129,7 +136,6 @@ export async function loadBookAnnotationsFromVault(
   const wordsFile = resolveVaultFile(app, activeWordsFilePath);
   if (wordsFile) {
     try {
-      // cachedRead не перечитывает большой файл с диска при каждом обновлении
       const content = await app.vault.cachedRead(wordsFile);
       const lines = content.split(/\r?\n/);
       for (let i = 0; i < lines.length; i++) {
@@ -229,9 +235,11 @@ export async function loadBookAnnotationsFromVault(
   return { words: words.reverse(), quotes: quotes.reverse() };
 }
 
-// В тёмной теме multiply делает подсветку невидимой, поэтому там используем обычное наложение
+// C4: учитываем как системную тёмную тему (body.theme-dark), так и локальные режимы «Ночь» / «Сепия»
 function highlightStyles(fill: string, opacity: string): Record<string, string> {
-  const isDark = document.body.classList.contains("theme-dark");
+  const isNightView = document.querySelector(".view-content.my-epub.my-epub-is-night") !== null;
+  const isSepiaView = document.querySelector(".view-content.my-epub.my-epub-is-sepia") !== null;
+  const isDark = isNightView || (!isSepiaView && document.body.classList.contains("theme-dark"));
   return {
     fill,
     "fill-opacity": isDark ? "0.38" : opacity,
@@ -251,7 +259,6 @@ function closeActiveHighlightPopover() {
   }
 }
 
-// B6: Всплывающая карточка по тапу на подсветку (перевод, пример, кнопки 🔊 и «Перейти в карточку», закрытие тапом вне)
 function showHighlightPopoverCard(
   rendition: Rendition,
   opts: {
@@ -309,7 +316,7 @@ function showHighlightPopoverCard(
     const ttsBtn = actions.createEl("button", {
       cls: "my-epub-hl-card-btn",
       text: "🔊 Озвучить",
-      attr: { type: "button" },
+      attr: { type: "button", "aria-label": "Озвучить слово" },
     });
     ttsBtn.onclick = () => speakEnglishText(wordToSpeak);
   }
@@ -324,7 +331,6 @@ function showHighlightPopoverCard(
     void openVaultFileAtLine(activeAnnotationsApp, opts.targetFilePath, opts.lineNumber);
   };
 
-  // Закрытие тапом вне карточки (как в главном окне Obsidian, так и внутри iframe книги)
   const cleanupTargets: Array<() => void> = [];
   const onOutsideTap = (ev: Event) => {
     const target = ev.target as Node | null;
@@ -496,7 +502,7 @@ export class QuickTranslateModal extends Modal {
     const speakBtn = topRow.createEl("button", {
       cls: "my-epub-modal-btn",
       text: "🔊",
-      attr: { title: "Озвучить" },
+      attr: { title: "Озвучить", "aria-label": "Озвучить слово" },
     });
     speakBtn.onclick = () => speakEnglishText(input.value);
 
@@ -519,7 +525,6 @@ export class QuickTranslateModal extends Modal {
       this.onSaveToVocab(currentVal);
     };
 
-    // Номер запроса: устаревший ответ не перезапишет результат нового
     let requestSeq = 0;
     let closed = false;
     const origOnClose = this.onClose.bind(this);
@@ -574,8 +579,63 @@ export class QuickTranslateModal extends Modal {
   }
 }
 
-// --- Единое модальное окно навигации: 📑 Главы | 🔖 Закладки | 🎓 Слова и цитаты ---
+// Вспомогательный ручной поиск по DOM секции, если item.find в epub.js недоступен
+function manualSearchInSectionDom(
+  sectionItem: any,
+  query: string,
+  maxNeeded: number
+): Array<{ cfi: string; excerpt: string }> {
+  const results: Array<{ cfi: string; excerpt: string }> = [];
+  const doc: Document | undefined = sectionItem?.document;
+  const body = doc?.body || doc?.documentElement;
+  if (!doc || !body) return results;
+
+  const qLower = query.toLowerCase();
+  const walker = doc.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+  let node: Node | null = walker.nextNode();
+
+  while (node && results.length < maxNeeded) {
+    const text = node.nodeValue || "";
+    const textLower = text.toLowerCase();
+    let fromIdx = 0;
+
+    while (results.length < maxNeeded) {
+      const matchPos = textLower.indexOf(qLower, fromIdx);
+      if (matchPos === -1) break;
+      fromIdx = matchPos + Math.max(1, qLower.length);
+
+      try {
+        const range = doc.createRange();
+        range.setStart(node, matchPos);
+        range.setEnd(node, Math.min(text.length, matchPos + query.length));
+        const cfi =
+          typeof sectionItem.cfiFromRange === "function"
+            ? sectionItem.cfiFromRange(range)
+            : typeof sectionItem.cfiFromElement === "function" && node.parentElement
+              ? sectionItem.cfiFromElement(node.parentElement)
+              : "";
+
+        if (cfi) {
+          const startSnippet = Math.max(0, matchPos - 45);
+          const endSnippet = Math.min(text.length, matchPos + query.length + 55);
+          const prefix = startSnippet > 0 ? "…" : "";
+          const suffix = endSnippet < text.length ? "…" : "";
+          const excerpt = `${prefix}${text.slice(startSnippet, endSnippet).replace(/\s+/g, " ").trim()}${suffix}`;
+          results.push({ cfi, excerpt });
+        }
+      } catch {
+        // Игнорируем ошибку построения CFI для узла
+      }
+    }
+    node = walker.nextNode();
+  }
+
+  return results;
+}
+
+// --- Единое модальное окно навигации: 📑 Главы | 🔖 Закладки | 🎓 Слова и цитаты | 🔍 Поиск ---
 export class BookNavModal extends Modal {
+  book: Book | null;
   toc: NavItem[];
   bookmarks: BookmarkItem[];
   words: BookWordEntry[];
@@ -587,14 +647,20 @@ export class BookNavModal extends Modal {
   onJumpCfi: (cfi: string) => void;
   onToggleBookmark: () => BookmarkItem[];
   onDeleteBookmark: (cfi: string) => BookmarkItem[];
-  activeTab: "toc" | "bookmarks" | "items" = "toc";
+  activeTab: "toc" | "bookmarks" | "items" | "search" = "toc";
   itemsFilter = "";
+  searchQuery = "";
+  searchResults: BookSearchMatch[] = [];
+  searchStatusText = "";
+  isSearching = false;
+  searchAbortSeq = 0;
   currentTocMarked = false;
   currentTocEl: HTMLElement | null = null;
 
   constructor(
     app: App,
     opts: {
+      book?: Book | null;
       toc: NavItem[];
       bookmarks: BookmarkItem[];
       words: BookWordEntry[];
@@ -610,6 +676,7 @@ export class BookNavModal extends Modal {
   ) {
     super(app);
     (this as any).shouldRestoreSelection = false;
+    this.book = opts.book ?? null;
     this.toc = opts.toc;
     this.bookmarks = opts.bookmarks;
     this.words = opts.words;
@@ -624,6 +691,8 @@ export class BookNavModal extends Modal {
   }
 
   safeClose() {
+    this.searchAbortSeq++;
+    this.isSearching = false;
     try {
       (this as any).shouldRestoreSelection = false;
       this.close();
@@ -637,6 +706,28 @@ export class BookNavModal extends Modal {
     this.render();
   }
 
+  resolveChapterNameForHref(rawHref: string): string {
+    const cleanHref = (rawHref || "").split("#")[0] || "";
+    if (!cleanHref || !this.toc) return "";
+    const findInItems = (items: NavItem[]): string => {
+      for (const it of items) {
+        const itemHref = (it.href || "").split("#")[0] || "";
+        if (
+          itemHref &&
+          (itemHref === cleanHref || cleanHref.endsWith(itemHref) || itemHref.endsWith(cleanHref))
+        ) {
+          return (it.label || "").trim();
+        }
+        if (it.subitems && it.subitems.length > 0) {
+          const sub = findInItems(it.subitems);
+          if (sub) return sub;
+        }
+      }
+      return "";
+    };
+    return findInItems(this.toc);
+  }
+
   render() {
     const { contentEl } = this;
     contentEl.empty();
@@ -645,10 +736,11 @@ export class BookNavModal extends Modal {
     const tabsRow = contentEl.createDiv("my-epub-nav-tabs");
     const totalItems = this.words.length + this.quotes.length;
 
-    const tabs: Array<{ id: "toc" | "bookmarks" | "items"; label: string }> = [
+    const tabs: Array<{ id: "toc" | "bookmarks" | "items" | "search"; label: string }> = [
       { id: "toc", label: "📑 Главы" },
       { id: "bookmarks", label: `🔖 Закладки (${this.bookmarks.length})` },
-      { id: "items", label: `🎓 Слова и цитаты (${totalItems})` },
+      { id: "items", label: `🎓 Слова (${totalItems})` },
+      { id: "search", label: "🔍 Поиск" },
     ];
 
     for (const t of tabs) {
@@ -657,6 +749,10 @@ export class BookNavModal extends Modal {
         text: t.label,
       });
       btn.onclick = () => {
+        if (this.activeTab === "search" && t.id !== "search") {
+          this.searchAbortSeq++;
+          this.isSearching = false;
+        }
         this.activeTab = t.id;
         this.render();
       };
@@ -664,6 +760,11 @@ export class BookNavModal extends Modal {
 
     if (this.activeTab === "items") {
       this.renderItemsTab(contentEl);
+      return;
+    }
+
+    if (this.activeTab === "search") {
+      this.renderSearchTab(contentEl);
       return;
     }
 
@@ -723,7 +824,7 @@ export class BookNavModal extends Modal {
       const delBtn = row.createEl("button", {
         cls: "my-epub-bm-del",
         text: "✕",
-        attr: { title: "Удалить закладку" },
+        attr: { title: "Удалить закладку", "aria-label": "Удалить закладку" },
       });
       delBtn.onclick = (e) => {
         e.stopPropagation();
@@ -733,7 +834,210 @@ export class BookNavModal extends Modal {
     }
   }
 
-  // Вкладка слов и цитат: поле поиска создаётся один раз, список перерисовывается отдельно
+  // C1: Вкладка «🔍 Поиск» по главам книги через book.spine.each и item.find(query) (с фолбэком на item.load + DOM)
+  renderSearchTab(parent: HTMLElement) {
+    const controlsRow = parent.createDiv("my-epub-search-controls");
+    const searchInput = controlsRow.createEl("input", {
+      cls: "my-epub-nav-search my-epub-search-input",
+      type: "search",
+      value: this.searchQuery,
+      placeholder: "Поиск фразы или слова по тексту книги…",
+    });
+
+    const runBtn = controlsRow.createEl("button", {
+      cls: "mod-cta my-epub-modal-btn",
+      text: "Найти",
+    });
+
+    const cancelBtn = controlsRow.createEl("button", {
+      cls: "my-epub-modal-btn",
+      text: "Стоп",
+    });
+    cancelBtn.style.display = this.isSearching ? "inline-flex" : "none";
+
+    const statusEl = parent.createDiv({
+      cls: "my-epub-search-status",
+      text: this.searchStatusText,
+    });
+    statusEl.style.display = this.searchStatusText ? "block" : "none";
+
+    const listEl = parent.createDiv("my-epub-toc-list");
+
+    const drawResults = () => {
+      listEl.empty();
+      statusEl.setText(this.searchStatusText);
+      statusEl.style.display = this.searchStatusText ? "block" : "none";
+      cancelBtn.style.display = this.isSearching ? "inline-flex" : "none";
+      runBtn.disabled = this.isSearching;
+
+      if (!this.isSearching && this.searchResults.length === 0 && this.searchQuery.trim()) {
+        listEl.createDiv({
+          cls: "my-epub-toc-empty",
+          text: this.searchStatusText ? "" : "Совпадений не найдено.",
+        });
+        return;
+      }
+
+      for (const item of this.searchResults) {
+        const row = listEl.createDiv("my-epub-bm-item");
+        const main = row.createDiv("my-epub-bm-main");
+        if (item.chapterLabel) {
+          main.createDiv({
+            cls: "my-epub-search-chapter",
+            text: `📑 ${item.chapterLabel}`,
+          });
+        }
+        main.createDiv({
+          cls: "my-epub-bm-title",
+          text: item.excerpt,
+        });
+        main.onclick = () => {
+          this.onJumpCfi(item.cfi);
+          this.safeClose();
+        };
+      }
+    };
+
+    const startSearch = async () => {
+      const q = searchInput.value.trim();
+      this.searchQuery = q;
+      if (q.length < 2) {
+        this.searchStatusText = "Введи минимум 2 символа для поиска.";
+        this.searchResults = [];
+        drawResults();
+        return;
+      }
+      if (!this.book || !this.book.spine) {
+        this.searchStatusText = "Книга ещё не загружена.";
+        drawResults();
+        return;
+      }
+
+      const mySeq = ++this.searchAbortSeq;
+      this.isSearching = true;
+      this.searchResults = [];
+      this.searchStatusText = "Подготовка к поиску…";
+      drawResults();
+
+      const spineItems: any[] = [];
+      const spineAny: any = this.book.spine;
+      if (typeof spineAny.each === "function") {
+        spineAny.each((item: any) => spineItems.push(item));
+      } else if (Array.isArray(spineAny.spineItems)) {
+        spineItems.push(...spineAny.spineItems);
+      }
+
+      const totalSections = spineItems.length;
+
+      for (let i = 0; i < totalSections; i++) {
+        if (mySeq !== this.searchAbortSeq) return;
+        const section = spineItems[i];
+        if (!section) continue;
+
+        this.searchStatusText = `Ищу в секции ${i + 1} из ${totalSections}… (найдено: ${this.searchResults.length})`;
+        statusEl.setText(this.searchStatusText);
+        statusEl.style.display = "block";
+
+        // Уступаем поток UI между главами, чтобы кнопка «Стоп» оставалась отзывчивой
+        await new Promise<void>((r) => window.setTimeout(r, 0));
+        if (mySeq !== this.searchAbortSeq) return;
+
+        let loadedHere = false;
+        try {
+          if (!section.document && typeof section.load === "function") {
+            await section.load(this.book.load.bind(this.book));
+            loadedHere = true;
+          }
+
+          if (mySeq !== this.searchAbortSeq) {
+            if (loadedHere) section.unload?.();
+            return;
+          }
+
+          const needed = MAX_SEARCH_RESULTS - this.searchResults.length;
+          let sectionMatches: Array<{ cfi: string; excerpt: string }> = [];
+
+          // Проверяем наличие item.find в используемой версии epub.js
+          if (typeof section.find === "function") {
+            try {
+              const rawFound = section.find(q);
+              if (Array.isArray(rawFound)) {
+                sectionMatches = rawFound
+                  .filter((m: any) => m && typeof m.cfi === "string" && m.cfi.length > 0)
+                  .slice(0, needed)
+                  .map((m: any) => ({
+                    cfi: String(m.cfi),
+                    excerpt: String(m.excerpt || "").replace(/\s+/g, " ").trim(),
+                  }));
+              }
+            } catch {
+              sectionMatches = manualSearchInSectionDom(section, q, needed);
+            }
+          } else {
+            sectionMatches = manualSearchInSectionDom(section, q, needed);
+          }
+
+          if (sectionMatches.length > 0) {
+            const chapterLabel =
+              this.resolveChapterNameForHref(section.href || "") || `Раздел ${i + 1}`;
+            for (const m of sectionMatches) {
+              if (this.searchResults.length >= MAX_SEARCH_RESULTS) break;
+              this.searchResults.push({
+                cfi: m.cfi,
+                excerpt: m.excerpt || q,
+                chapterLabel,
+              });
+            }
+            drawResults();
+          }
+        } catch {
+          // Пропускаем секцию при ошибке чтения
+        } finally {
+          if (loadedHere) {
+            try {
+              section.unload?.();
+            } catch {
+              // Игнорируем
+            }
+          }
+        }
+
+        if (this.searchResults.length >= MAX_SEARCH_RESULTS) {
+          break;
+        }
+      }
+
+      if (mySeq !== this.searchAbortSeq) return;
+      this.isSearching = false;
+      const hitLimit = this.searchResults.length >= MAX_SEARCH_RESULTS;
+      this.searchStatusText =
+        this.searchResults.length > 0
+          ? `Найдено совпадений: ${this.searchResults.length}${hitLimit ? ` (показаны первые ${MAX_SEARCH_RESULTS})` : ""}`
+          : "Совпадений не найдено.";
+      drawResults();
+    };
+
+    cancelBtn.onclick = () => {
+      this.searchAbortSeq++;
+      this.isSearching = false;
+      this.searchStatusText = `Поиск остановлен (найдено: ${this.searchResults.length}).`;
+      drawResults();
+    };
+
+    runBtn.onclick = () => void startSearch();
+    searchInput.onkeydown = (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        void startSearch();
+      }
+    };
+
+    drawResults();
+    if (!this.isSearching) {
+      window.setTimeout(() => searchInput.focus(), 30);
+    }
+  }
+
   renderItemsTab(parent: HTMLElement) {
     if (this.words.length === 0 && this.quotes.length === 0) {
       const empty = parent.createDiv("my-epub-toc-list");
@@ -813,7 +1117,7 @@ export class BookNavModal extends Modal {
     const ttsBtn = rightBtns.createEl("button", {
       cls: "my-epub-bm-del",
       text: "🔊",
-      attr: { title: "Озвучить слово" },
+      attr: { title: "Озвучить слово", "aria-label": "Озвучить слово" },
     });
     ttsBtn.onclick = (e) => {
       e.stopPropagation();
@@ -825,7 +1129,7 @@ export class BookNavModal extends Modal {
       const jumpBtn = rightBtns.createEl("button", {
         cls: "my-epub-bm-del",
         text: "📖",
-        attr: { title: "Перейти к месту в книге" },
+        attr: { title: "Перейти к месту в книге", "aria-label": "Перейти к месту в книге" },
       });
       jumpBtn.onclick = (e) => {
         e.stopPropagation();
@@ -876,6 +1180,8 @@ export class BookNavModal extends Modal {
   }
 
   onClose() {
+    this.searchAbortSeq++;
+    this.isSearching = false;
     this.contentEl.empty();
   }
 }

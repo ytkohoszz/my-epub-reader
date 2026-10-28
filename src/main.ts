@@ -38,12 +38,15 @@ const VIEW_TYPE = "my-epub-view";
 const MAX_CACHED_BOOKS = 15;
 const YAML_SYNC_DEBOUNCE_MS = 2000;
 const SELECTION_THROTTLE_MS = 120;
+const READING_IDLE_PAUSE_MS = 120_000; // 2 минуты бездействия
+const READING_TICK_INTERVAL_MS = 15_000;
 
-type ThemeMode = "auto" | "sepia";
+type ThemeMode = "auto" | "sepia" | "night";
 type FontFamily = "default" | "serif" | "sans" | "mono";
 type PageAnimation = "slide" | "fade" | "none";
 type BarPosition = "bottom" | "top";
 type SpreadMode = "none" | "auto";
+type TextAlignMode = "default" | "justify" | "left";
 
 interface LegacyLocationCacheEntry {
   sig: string;
@@ -69,6 +72,9 @@ export interface Settings {
   themeMode?: ThemeMode;
   fontFamily?: FontFamily;
   lineHeight?: number;
+  pageMarginPx?: number;
+  textAlign?: TextAlignMode;
+  hyphens?: boolean;
   pageAnimation?: PageAnimation;
   barPosition?: BarPosition;
   spreadMode?: SpreadMode;
@@ -87,6 +93,9 @@ const DEFAULTS: Settings = {
   themeMode: "auto",
   fontFamily: "serif",
   lineHeight: 1.6,
+  pageMarginPx: 12,
+  textAlign: "default",
+  hyphens: false,
   pageAnimation: "slide",
   barPosition: "bottom",
   spreadMode: "none",
@@ -107,6 +116,16 @@ function migrateSettings(raw: any): Settings {
   if (!s.wordsFilePath || typeof s.wordsFilePath !== "string") s.wordsFilePath = DEFAULTS.wordsFilePath;
   if (!s.quotesFilePath || typeof s.quotesFilePath !== "string") s.quotesFilePath = DEFAULTS.quotesFilePath;
   if (s.spreadMode !== "auto" && s.spreadMode !== "none") s.spreadMode = "none";
+  if (s.themeMode !== "auto" && s.themeMode !== "sepia" && s.themeMode !== "night") {
+    s.themeMode = "auto";
+  }
+  if (typeof s.pageMarginPx !== "number" || isNaN(s.pageMarginPx)) {
+    s.pageMarginPx = DEFAULTS.pageMarginPx;
+  }
+  if (s.textAlign !== "default" && s.textAlign !== "justify" && s.textAlign !== "left") {
+    s.textAlign = "default";
+  }
+  if (typeof s.hyphens !== "boolean") s.hyphens = false;
   return s;
 }
 
@@ -118,6 +137,14 @@ function hashBookPathToFileName(bookPath: string): string {
   }
   const hex = (h >>> 0).toString(16).padStart(8, "0");
   return `loc-${hex}.json`;
+}
+
+function formatDurationMinutes(minutesFloat: number): string {
+  const mins = Math.max(1, Math.round(minutesFloat));
+  if (mins < 60) return `~${mins} мин`;
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  return m > 0 ? `~${h} ч ${m} мин` : `~${h} ч`;
 }
 
 const FONT_MAP: Record<FontFamily, string> = {
@@ -151,14 +178,22 @@ export class EpubView extends FileView {
   resizeTimer: number | null = null;
   animTimer: number | null = null;
   yamlSyncTimer: number | null = null;
+  readingTickTimer: number | null = null;
   isFullscreen = false;
   lastGestureTime = 0;
 
-  // A1: флаг однократной подписки на события workspace за жизнь view
   private workspaceEventsRegistered = false;
-
-  // A2: реестр всех таймеров выделения в iframe для гарантированной очистки
   private selectionTimers = new Set<number>();
+
+  // C2: скорость последних 10 переходов страниц (в мс)
+  turnTimestampsHistory: number[] = [];
+  turnDurationsMs: number[] = [];
+  lastTransitionTimestamp = 0;
+
+  // C3: учёт времени активного чтения с паузой после 2 минут бездействия
+  lastActivityAt = 0;
+  lastReadingTickAt = 0;
+  unsavedReadingSeconds = 0;
 
   stableCfi: string | null = null;
   lastLocalPositionSavedAt: string | null = null;
@@ -216,8 +251,70 @@ export class EpubView extends FileView {
       this.app.workspace.on("css-change", () => this.applyStyles())
     );
     this.registerEvent(
-      this.app.workspace.on("active-leaf-change", () => this.plugin.syncGlobalBodyClasses())
+      this.app.workspace.on("active-leaf-change", () => {
+        this.plugin.syncGlobalBodyClasses();
+        this.recordReadingActivity();
+      })
     );
+  }
+
+  // C3: отметка активности пользователя и старт фонового тика времени чтения
+  recordReadingActivity() {
+    const now = Date.now();
+    this.accrueActiveReadingTime(now);
+    this.lastActivityAt = now;
+    this.lastReadingTickAt = now;
+  }
+
+  private accrueActiveReadingTime(now = Date.now()) {
+    if (!this.isInitialLoadDone || !this.lastReadingTickAt || !this.lastActivityAt) {
+      this.lastReadingTickAt = now;
+      return;
+    }
+    if (document.visibilityState === "hidden") {
+      this.lastReadingTickAt = now;
+      return;
+    }
+    const activeView = this.app.workspace.getActiveViewOfType(EpubView);
+    if (activeView !== this) {
+      this.lastReadingTickAt = now;
+      return;
+    }
+    // Пауза после 2 минут бездействия
+    if (now - this.lastActivityAt <= READING_IDLE_PAUSE_MS) {
+      const deltaSec = Math.max(0, Math.min(60, (now - this.lastReadingTickAt) / 1000));
+      this.unsavedReadingSeconds += deltaSec;
+    }
+    this.lastReadingTickAt = now;
+  }
+
+  private startReadingTimer() {
+    if (this.readingTickTimer !== null) window.clearInterval(this.readingTickTimer);
+    const now = Date.now();
+    this.lastActivityAt = now;
+    this.lastReadingTickAt = now;
+    this.readingTickTimer = window.setInterval(() => {
+      this.accrueActiveReadingTime(Date.now());
+      if (this.unsavedReadingSeconds >= 60) {
+        this.requestYamlProgressSync();
+      }
+    }, READING_TICK_INTERVAL_MS);
+  }
+
+  // C2: фиксация скорости переходов между страницами (последние 10 переходов)
+  private recordPageTransitionForPace() {
+    const now = Date.now();
+    if (this.lastTransitionTimestamp > 0) {
+      const dt = now - this.lastTransitionTimestamp;
+      // Учитываем только реальное чтение страницы (от 3 сек до 3 мин на страницу)
+      if (dt >= 3000 && dt <= 180_000) {
+        this.turnDurationsMs.push(dt);
+        if (this.turnDurationsMs.length > 10) {
+          this.turnDurationsMs.shift();
+        }
+      }
+    }
+    this.lastTransitionTimestamp = now;
   }
 
   async onLoadFile(file: TFile) {
@@ -240,6 +337,10 @@ export class EpubView extends FileView {
     this.lastBoxWidth = 0;
     this.lastBoxHeight = 0;
     this.navHistory = [];
+    this.turnTimestampsHistory = [];
+    this.turnDurationsMs = [];
+    this.lastTransitionTimestamp = Date.now();
+    this.unsavedReadingSeconds = 0;
     this.capturedWord = "";
     this.capturedQuote = "";
     this.capturedCfi = null;
@@ -260,7 +361,6 @@ export class EpubView extends FileView {
     this.currentChapterTitle = "";
     this.pendingYamlSync = false;
 
-    // A3: сразу ищем привязанную заметку книги и выбираем более свежую стартовую позицию
     this.trySilentResolveLinkedBookNote(file);
     const initialPos = this.resolveInitialCfiBeforeRender(file);
     this.stableCfi = initialPos.cfi;
@@ -279,7 +379,10 @@ export class EpubView extends FileView {
     const backDismissBtn = this.backPillEl.createSpan({
       cls: "my-epub-back-pill-close",
       text: "✕",
-      attr: { title: "Скрыть кнопку возврата и остаться здесь" },
+      attr: {
+        title: "Скрыть кнопку возврата и остаться здесь",
+        "aria-label": "Скрыть кнопку возврата",
+      },
     });
     this.backPillTextEl.onclick = (e) => {
       e.stopPropagation();
@@ -293,9 +396,18 @@ export class EpubView extends FileView {
     };
     this.updateBackPillState();
 
+    // C5: все кнопки с эмодзи снабжены aria-label
     this.fsBarEl = root.createDiv("my-epub-fs-bar");
-    const fsPrev = this.fsBarEl.createEl("button", { cls: "my-epub-fs-btn", text: "◀" });
-    this.fsInfoEl = this.fsBarEl.createSpan({ cls: "my-epub-fs-info", text: "… · ⛶" });
+    const fsPrev = this.fsBarEl.createEl("button", {
+      cls: "my-epub-fs-btn",
+      text: "◀",
+      attr: { "aria-label": "Предыдущая страница" },
+    });
+    this.fsInfoEl = this.fsBarEl.createSpan({
+      cls: "my-epub-fs-info",
+      text: "… · ⛶",
+      attr: { "aria-label": "Выйти из полноэкранного режима" },
+    });
     this.fsQuickTrBtn = this.fsBarEl.createEl("button", {
       cls: "my-epub-fs-btn my-epub-word-btn",
       text: "🌐",
@@ -304,12 +416,18 @@ export class EpubView extends FileView {
     this.fsAddWordBtn = this.fsBarEl.createEl("button", {
       cls: "my-epub-fs-btn my-epub-word-btn",
       text: "+ Слово",
+      attr: { "aria-label": "Добавить слово в словарь" },
     });
     this.fsAddQuoteBtn = this.fsBarEl.createEl("button", {
       cls: "my-epub-fs-btn my-epub-word-btn",
       text: "💬",
+      attr: { "aria-label": "Добавить цитату" },
     });
-    const fsNext = this.fsBarEl.createEl("button", { cls: "my-epub-fs-btn", text: "▶" });
+    const fsNext = this.fsBarEl.createEl("button", {
+      cls: "my-epub-fs-btn",
+      text: "▶",
+      attr: { "aria-label": "Следующая страница" },
+    });
 
     fsPrev.onclick = (e) => { e.stopPropagation(); this.turnPage("prev"); };
     fsNext.onclick = (e) => { e.stopPropagation(); this.turnPage("next"); };
@@ -322,10 +440,21 @@ export class EpubView extends FileView {
     this.applyBarPosition();
 
     const leftGroup = this.barEl.createDiv("my-epub-group");
-    const prev = leftGroup.createEl("button", { cls: "my-epub-btn", text: "◀" });
-    const tocBtn = leftGroup.createEl("button", { cls: "my-epub-btn", text: "📑" });
-    tocBtn.setAttr("aria-label", "Оглавление, закладки и выписанные слова");
-    const smaller = leftGroup.createEl("button", { cls: "my-epub-btn", text: "A−" });
+    const prev = leftGroup.createEl("button", {
+      cls: "my-epub-btn",
+      text: "◀",
+      attr: { "aria-label": "Предыдущая страница" },
+    });
+    const tocBtn = leftGroup.createEl("button", {
+      cls: "my-epub-btn",
+      text: "📑",
+      attr: { "aria-label": "Оглавление, закладки, слова и поиск" },
+    });
+    const smaller = leftGroup.createEl("button", {
+      cls: "my-epub-btn",
+      text: "A−",
+      attr: { "aria-label": "Уменьшить размер шрифта" },
+    });
 
     this.info = this.barEl.createDiv({
       cls: "my-epub-info",
@@ -343,25 +472,40 @@ export class EpubView extends FileView {
     this.addWordBtn = rightGroup.createEl("button", {
       cls: "my-epub-btn my-epub-word-btn",
       text: "+ Слово",
+      attr: { "aria-label": "Добавить выделенное слово в словарь" },
     });
     this.addQuoteBtn = rightGroup.createEl("button", {
       cls: "my-epub-btn my-epub-word-btn",
       text: "💬",
-      attr: { "aria-label": "Добавить цитату" },
+      attr: { "aria-label": "Добавить выделенную цитату" },
     });
     this.bindActionButton(this.quickTrBtn, () => this.handleQuickTranslateClick());
     this.bindActionButton(this.addWordBtn, () => this.handleAddWordClick());
     this.bindActionButton(this.addQuoteBtn, () => this.handleAddQuoteClick());
     this.updateSelectionButtonsState();
 
-    const bigger = rightGroup.createEl("button", { cls: "my-epub-btn", text: "A+" });
-    const fontBtn = rightGroup.createEl("button", { cls: "my-epub-btn", text: "🔤" });
-    fontBtn.setAttr("aria-label", "Вид, шрифт, разворот и привязка книги");
+    const bigger = rightGroup.createEl("button", {
+      cls: "my-epub-btn",
+      text: "A+",
+      attr: { "aria-label": "Увеличить размер шрифта" },
+    });
+    const fontBtn = rightGroup.createEl("button", {
+      cls: "my-epub-btn",
+      text: "🔤",
+      attr: { "aria-label": "Вид, шрифт, поля, выравнивание и привязка книги" },
+    });
     this.themeBtn = rightGroup.createEl("button", { cls: "my-epub-btn" });
     this.updateThemeBtnText();
-    this.fsBtn = rightGroup.createEl("button", { cls: "my-epub-btn", text: "⛶" });
-    this.fsBtn.setAttr("aria-label", "Полноэкранный режим");
-    const next = rightGroup.createEl("button", { cls: "my-epub-btn", text: "▶" });
+    this.fsBtn = rightGroup.createEl("button", {
+      cls: "my-epub-btn",
+      text: "⛶",
+      attr: { "aria-label": "Полноэкранный режим" },
+    });
+    const next = rightGroup.createEl("button", {
+      cls: "my-epub-btn",
+      text: "▶",
+      attr: { "aria-label": "Следующая страница" },
+    });
 
     try {
       const data = await this.app.vault.readBinary(file);
@@ -406,6 +550,7 @@ export class EpubView extends FileView {
       this.lastBoxWidth = this.boxEl.clientWidth;
       this.lastBoxHeight = this.boxEl.clientHeight;
       this.setupResizeObserver();
+      this.startReadingTimer();
 
       await this.book.ready;
       if (currentLoadId !== this.loadId || !this.book) return;
@@ -422,7 +567,6 @@ export class EpubView extends FileView {
       await this.refreshBookHighlights();
       if (currentLoadId !== this.loadId || !this.book || !this.rendition) return;
 
-      // A4 + A5: пробуем мгновенно загрузить locations из файлового кэша плагина
       const loadedFromCache = await this.tryLoadCachedLocations(file, currentLoadId);
       if (currentLoadId !== this.loadId || !this.book || !this.rendition) return;
 
@@ -440,8 +584,6 @@ export class EpubView extends FileView {
         this.ExplicitCfiJumpPending = false;
         this.requestYamlProgressSync();
       } else {
-        // A5: не блокируем UI — книга уже открыта и показывает примерный % через cfiFromPercentage / spine,
-        // а генерацию страниц запускаем в фоне с проверкой loadId
         this.isGeneratingLocations = true;
         if (this.stableCfi) this.updateProgressLabels(this.stableCfi);
         void this.generateLocationsInBackground(file, currentLoadId);
@@ -453,7 +595,6 @@ export class EpubView extends FileView {
     }
   }
 
-  // A3: предвыбор стартового CFI до рендера книги (сравнение времени YAML и data.json)
   private resolveInitialCfiBeforeRender(file: TFile): { cfi: string | null; savedAt: string | null } {
     const localCfi = this.plugin.settings.progress[file.path] || null;
     const localTimeStr = this.plugin.settings.progressUpdatedAt?.[file.path] || null;
@@ -495,11 +636,9 @@ export class EpubView extends FileView {
       return { cfi: localCfi, savedAt: localTimeStr };
     }
 
-    // Если времени нет хотя бы с одной стороны — приоритет у YAML
     return { cfi: yamlCfi, savedAt: yamlTimeStr || localTimeStr };
   }
 
-  // A4: чтение кэша страниц из отдельного файла в папке плагина
   private async tryLoadCachedLocations(file: TFile, currentLoadId: number): Promise<boolean> {
     if (!this.book) return false;
     const sig = `${file.stat.mtime}:${file.stat.size}`;
@@ -514,7 +653,6 @@ export class EpubView extends FileView {
     }
   }
 
-  // A5: неблокирующая фоновая генерация страниц с учётом loadId
   private async generateLocationsInBackground(file: TFile, currentLoadId: number) {
     if (!this.book) return;
     const sig = `${file.stat.mtime}:${file.stat.size}`;
@@ -554,7 +692,6 @@ export class EpubView extends FileView {
     }
   }
 
-  // A5: оценка процента через cfiFromPercentage / spine, пока locations.generate ещё идёт
   private computeFastPercentage(cfi: string, loc?: any): number {
     if (!this.book) return this.approxProgressPct ?? 0;
 
@@ -574,14 +711,6 @@ export class EpubView extends FileView {
       const dispTotal = Math.max(1, start.displayed?.total ?? 1);
       const frac = (start.index + (dispPage - 1) / dispTotal) / spineLen;
       const pct = Math.max(0, Math.min(100, Math.round(frac * 100)));
-      // Проверяем cfiFromPercentage, если epubjs поддерживает его для текущего состояния
-      try {
-        if (typeof this.book.locations?.cfiFromPercentage === "function" && this.book.locations.length() > 0) {
-          void this.book.locations.cfiFromPercentage(pct / 100);
-        }
-      } catch {
-        // Игнорируем
-      }
       this.approxProgressPct = pct;
       return pct;
     }
@@ -653,17 +782,42 @@ export class EpubView extends FileView {
     return "";
   }
 
+  // C2: оценка времени до конца главы и книги по скорости последних 10 переходов (при >= 3 замерах)
   getChapterSummaryText(): string {
     const parts: string[] = [];
     if (this.currentChapterTitle) parts.push(`Глава: «${this.currentChapterTitle}»`);
+
+    const hasPaceData = this.turnDurationsMs.length >= 3;
+    const avgTurnMs = hasPaceData
+      ? this.turnDurationsMs.reduce((acc, v) => acc + v, 0) / this.turnDurationsMs.length
+      : 0;
+
     if (this.chapterPageCurrent !== null && this.chapterPageTotal !== null) {
-      const left = Math.max(0, this.chapterPageTotal - this.chapterPageCurrent);
-      parts.push(
-        left === 0
-          ? `последняя страница главы (${this.chapterPageCurrent}/${this.chapterPageTotal})`
-          : `до конца главы: ${left} стр. (${this.chapterPageCurrent} из ${this.chapterPageTotal})`
-      );
+      const leftInChapter = Math.max(0, this.chapterPageTotal - this.chapterPageCurrent);
+      if (leftInChapter === 0) {
+        parts.push(`последняя страница главы (${this.chapterPageCurrent}/${this.chapterPageTotal})`);
+      } else {
+        const etaChapter =
+          hasPaceData && avgTurnMs > 0
+            ? `, ${formatDurationMinutes((leftInChapter * avgTurnMs) / 60_000)}`
+            : "";
+        parts.push(
+          `до конца главы: ${leftInChapter} стр.${etaChapter} (${this.chapterPageCurrent} из ${this.chapterPageTotal})`
+        );
+      }
     }
+
+    if (
+      hasPaceData &&
+      avgTurnMs > 0 &&
+      this.currentPageNum !== null &&
+      this.totalPagesNum !== null &&
+      this.totalPagesNum > this.currentPageNum
+    ) {
+      const leftInBook = this.totalPagesNum - this.currentPageNum;
+      parts.push(`до конца книги: ${formatDurationMinutes((leftInBook * avgTurnMs) / 60_000)}`);
+    }
+
     return parts.join(" · ");
   }
 
@@ -741,7 +895,6 @@ export class EpubView extends FileView {
     return list;
   }
 
-  // A3: сверка локальной позиции и YAML заметки книги по метке времени (позиция_время vs progressUpdatedAt)
   async reconcilePositionWithBookNote(file: TFile, currentLoadId: number) {
     if (this.ExplicitCfiJumpPending) return;
     if (!this.linkedBookNote || !this.book || !this.rendition) return;
@@ -779,7 +932,6 @@ export class EpubView extends FileView {
         if (yamlPage !== null) {
           const cfiIdx = Number(this.book!.locations.locationFromCfi(yamlCfi));
           const cfiPage = Math.max(1, Math.min(this.totalPagesNum!, cfiIdx + 1));
-          // Если в дашборде вручную изменили `прочитано`, переходим к указанной странице
           if (Math.abs(cfiPage - yamlPage) >= 1) {
             return this.getCfiFromPageNumber(yamlPage);
           }
@@ -793,7 +945,6 @@ export class EpubView extends FileView {
     };
 
     if (hasBothTimes) {
-      // Оба времени известны — побеждает более свежая запись
       if (localMs > yamlMs) {
         return;
       }
@@ -812,7 +963,6 @@ export class EpubView extends FileView {
         }
         return;
       }
-      // Если времена равны, но `прочитано` в YAML было изменено вручную в дашборде
       if (yamlPage !== null && yamlPage !== localPage) {
         const targetCfi = this.getCfiFromPageNumber(yamlPage);
         if (targetCfi && currentLoadId === this.loadId) {
@@ -831,7 +981,6 @@ export class EpubView extends FileView {
       return;
     }
 
-    // Если времени нет хотя бы с одной стороны — поведение прежнее (YAML приоритетнее)
     if (yamlPage !== null && yamlPage !== localPage) {
       const targetCfi = pickTargetCfiFromYaml();
       if (targetCfi && currentLoadId === this.loadId) {
@@ -923,6 +1072,7 @@ export class EpubView extends FileView {
 
   async jumpToCfi(cfi: string, recordHistory = false) {
     if (!cfi) return;
+    this.recordReadingActivity();
     if (recordHistory) this.pushNavHistory();
     const navCfi = cfi.includes(",") ? cfi.replace(/,[^,)]+\)$/, ")") : cfi;
     const nowIso = new Date().toISOString();
@@ -955,6 +1105,7 @@ export class EpubView extends FileView {
       const now = Date.now();
       if (now - lastTrigger < 350) return;
       lastTrigger = now;
+      this.recordReadingActivity();
       this.syncSelectionFromAllIframes();
       handler();
     };
@@ -998,6 +1149,7 @@ export class EpubView extends FileView {
     const cleanedQuote = cleanSelectedQuote(raw);
     if (!cleanedWord && !cleanedQuote) return;
 
+    this.recordReadingActivity();
     this.capturedWord = cleanedWord;
     this.capturedQuote = cleanedQuote;
     this.lastSelectionAt = Date.now();
@@ -1088,14 +1240,19 @@ export class EpubView extends FileView {
     }, YAML_SYNC_DEBOUNCE_MS);
   }
 
-  // A3: запись прогресса, `позиция` (epubcfi) и `позиция_время` (ISO-строка) в YAML заметки книги
+  // C3: синхронизация прогресса и накопительного поля `минут_чтения` (только при изменении значения)
   async flushYamlProgress() {
     if (this.yamlSyncTimer) {
       window.clearTimeout(this.yamlSyncTimer);
       this.yamlSyncTimer = null;
     }
     if (this.navHistory.length > 0) return;
-    if (!this.pendingYamlSync || !this.linkedBookNote || !this.file) return;
+
+    this.accrueActiveReadingTime(Date.now());
+    const addedReadingMinutes = Math.floor(this.unsavedReadingSeconds / 60);
+
+    if (!this.pendingYamlSync && addedReadingMinutes <= 0) return;
+    if (!this.linkedBookNote || !this.file) return;
     if (this.linkedBookNote.linkedEpubPath !== this.file.path) return;
 
     const noteFile = this.linkedBookNote.file;
@@ -1114,6 +1271,7 @@ export class EpubView extends FileView {
     const todayISO = getTodayISO();
     const fmCache = this.app.metadataCache.getFileCache(noteFile)?.frontmatter;
     if (
+      addedReadingMinutes <= 0 &&
       fmCache &&
       (totalNum === null || fmCache["страниц"] === totalNum) &&
       (pageNum === null || fmCache["прочитано"] === pageNum) &&
@@ -1125,19 +1283,46 @@ export class EpubView extends FileView {
       return;
     }
 
+    if (addedReadingMinutes > 0) {
+      this.unsavedReadingSeconds -= addedReadingMinutes * 60;
+    }
+
     try {
       await this.app.fileManager.processFrontMatter(noteFile, (fm) => {
-        if (totalNum !== null && totalNum > 0) fm["страниц"] = totalNum;
-        if (pageNum !== null && pageNum > 0) fm["прочитано"] = pageNum;
-        if (pctNum !== null && pctNum >= 0) fm["прогресс"] = pctNum;
-        fm["последнее_чтение"] = todayISO;
-        fm["позиция"] = cfiToSync;
-        fm["позиция_время"] = posTimeIso;
+        if (totalNum !== null && totalNum > 0 && fm["страниц"] !== totalNum) {
+          fm["страниц"] = totalNum;
+        }
+        if (pageNum !== null && pageNum > 0 && fm["прочитано"] !== pageNum) {
+          fm["прочитано"] = pageNum;
+        }
+        if (pctNum !== null && pctNum >= 0 && fm["прогресс"] !== pctNum) {
+          fm["прогресс"] = pctNum;
+        }
+        if (fm["последнее_чтение"] !== todayISO) {
+          fm["последнее_чтение"] = todayISO;
+        }
+        if (fm["позиция"] !== cfiToSync) {
+          fm["позиция"] = cfiToSync;
+        }
+        if (fm["позиция_время"] !== posTimeIso) {
+          fm["позиция_время"] = posTimeIso;
+        }
+        if (addedReadingMinutes > 0) {
+          const prevMin = Number(fm["минут_чтения"]);
+          const baseMin = Number.isFinite(prevMin) && prevMin >= 0 ? Math.round(prevMin) : 0;
+          const nextMin = baseMin + addedReadingMinutes;
+          if (fm["минут_чтения"] !== nextMin) {
+            fm["минут_чтения"] = nextMin;
+          }
+        }
         if (!fm["статус"] || fm["статус"] === "В планах") {
           fm["статус"] = "Читаю";
         }
       });
     } catch (e) {
+      if (addedReadingMinutes > 0) {
+        this.unsavedReadingSeconds += addedReadingMinutes * 60;
+      }
       console.error("MyEpubPlugin error syncing YAML frontmatter:", e);
     }
   }
@@ -1305,6 +1490,13 @@ export class EpubView extends FileView {
 
   turnPage(dir: "next" | "prev") {
     if (!this.rendition) return;
+    this.recordReadingActivity();
+    if (dir === "next") {
+      this.recordPageTransitionForPace();
+    } else {
+      this.lastTransitionTimestamp = Date.now();
+    }
+
     this.isResizing = false;
     if (this.resizeTimer) {
       window.clearTimeout(this.resizeTimer);
@@ -1383,7 +1575,6 @@ export class EpubView extends FileView {
         }
       };
 
-      // A2: throttle ~120 мс для selectionchange без дублирующего слушателя на window
       let lastSelCheckTime = 0;
       let selThrottleTimer: number | null = null;
 
@@ -1408,11 +1599,13 @@ export class EpubView extends FileView {
       };
 
       const onDocTouchEnd = () => {
+        this.recordReadingActivity();
         this.scheduleSelectionTimer(checkIframeSelection, 30);
         this.scheduleSelectionTimer(checkIframeSelection, 180);
       };
 
       const onDocMouseUp = () => {
+        this.recordReadingActivity();
         this.scheduleSelectionTimer(checkIframeSelection, 20);
       };
 
@@ -1437,6 +1630,7 @@ export class EpubView extends FileView {
     }
 
     this.rendition.on("keyup", (e: KeyboardEvent) => {
+      this.recordReadingActivity();
       if (e.key === "ArrowRight") this.turnPage("next");
       else if (e.key === "ArrowLeft") this.turnPage("prev");
       else if (e.key === "Escape" && this.isFullscreen) this.toggleFullscreen(false);
@@ -1489,6 +1683,7 @@ export class EpubView extends FileView {
       const e = ev as TouchEvent;
       const touch = e.changedTouches?.[0] ?? e.touches?.[0];
       if (!touch) return;
+      this.recordReadingActivity();
       startX = touch.screenX;
       startY = touch.screenY;
       lastX = touch.screenX;
@@ -1612,6 +1807,7 @@ export class EpubView extends FileView {
   }
 
   toggleFullscreen(force?: boolean) {
+    this.recordReadingActivity();
     this.isResizing = true;
     this.isFullscreen = force !== undefined ? force : !this.isFullscreen;
     this.contentEl.toggleClass("my-epub-in-fullscreen", this.isFullscreen);
@@ -1621,12 +1817,14 @@ export class EpubView extends FileView {
   }
 
   async openToc() {
+    this.recordReadingActivity();
     this.prepareMainWindowFocusBeforeModal();
     await this.refreshBookHighlights();
     const toc = this.book?.navigation?.toc ?? [];
     const bmList = this.file ? this.plugin.settings.bookmarks?.[this.file.path] ?? [] : [];
 
     new BookNavModal(this.app, {
+      book: this.book,
       toc,
       bookmarks: bmList,
       words: this.bookWords,
@@ -1648,10 +1846,15 @@ export class EpubView extends FileView {
   }
 
   openTypographyMenu(e: MouseEvent) {
+    this.recordReadingActivity();
     const menu = new Menu();
     const s = this.plugin.settings;
+    const curTheme = s.themeMode ?? "auto";
     const curFont = s.fontFamily ?? "serif";
     const curLh = s.lineHeight ?? 1.6;
+    const curMargin = s.pageMarginPx ?? 12;
+    const curAlign = s.textAlign ?? "default";
+    const curHyphens = Boolean(s.hyphens);
     const curAnim = s.pageAnimation ?? "slide";
     const curPos = s.barPosition ?? "bottom";
     const curSpread = s.spreadMode ?? "none";
@@ -1684,6 +1887,28 @@ export class EpubView extends FileView {
         item.setTitle(`🧭 Перейти к странице (1–${this.totalPagesNum})…`).onClick(() => {
           this.openJumpModal();
         })
+      );
+    }
+
+    menu.addSeparator();
+
+    // C4: выбор темы чтения (Авто / Сепия / Ночь)
+    const themes: { id: ThemeMode; label: string }[] = [
+      { id: "auto", label: "Тема: Авто (как в Obsidian)" },
+      { id: "sepia", label: "Тема: 📜 Сепия" },
+      { id: "night", label: "Тема: 🌙 Ночь" },
+    ];
+    for (const tm of themes) {
+      menu.addItem((item) =>
+        item
+          .setTitle(tm.label)
+          .setChecked(curTheme === tm.id)
+          .onClick(() => {
+            s.themeMode = tm.id;
+            this.updateThemeBtnText();
+            this.applyStyles();
+            this.plugin.requestSaveSettings();
+          })
       );
     }
 
@@ -1748,6 +1973,56 @@ export class EpubView extends FileView {
           })
       );
     }
+
+    menu.addSeparator();
+
+    // C4: поля страницы, выравнивание и переносы
+    const margins = [
+      { val: 6, label: "Поля страницы: Узкие (6 px)" },
+      { val: 12, label: "Поля страницы: Стандартные (12 px)" },
+      { val: 28, label: "Поля страницы: Широкие (28 px)" },
+    ];
+    for (const mg of margins) {
+      menu.addItem((item) =>
+        item
+          .setTitle(mg.label)
+          .setChecked(Math.abs(curMargin - mg.val) <= 2)
+          .onClick(() => {
+            s.pageMarginPx = mg.val;
+            this.applyStylesAndRestore();
+            this.plugin.requestSaveSettings();
+          })
+      );
+    }
+
+    const aligns: { id: TextAlignMode; label: string }[] = [
+      { id: "default", label: "Выравнивание: По умолчанию" },
+      { id: "justify", label: "Выравнивание: По ширине" },
+      { id: "left", label: "Выравнивание: По левому краю" },
+    ];
+    for (const al of aligns) {
+      menu.addItem((item) =>
+        item
+          .setTitle(al.label)
+          .setChecked(curAlign === al.id)
+          .onClick(() => {
+            s.textAlign = al.id;
+            this.applyStylesAndRestore();
+            this.plugin.requestSaveSettings();
+          })
+      );
+    }
+
+    menu.addItem((item) =>
+      item
+        .setTitle("Переносы слов (Hyphens)")
+        .setChecked(curHyphens)
+        .onClick(() => {
+          s.hyphens = !curHyphens;
+          this.applyStylesAndRestore();
+          this.plugin.requestSaveSettings();
+        })
+    );
 
     if (Platform.isDesktop) {
       menu.addSeparator();
@@ -1901,14 +2176,23 @@ export class EpubView extends FileView {
 
   updateThemeBtnText() {
     if (!this.themeBtn) return;
-    const isSepia = this.plugin.settings.themeMode === "sepia";
-    this.themeBtn.setText(isSepia ? "📜" : "🌗");
-    this.themeBtn.setAttr("aria-label", isSepia ? "Режим: Сепия" : "Режим: Авто (тема Obsidian)");
+    const mode = this.plugin.settings.themeMode ?? "auto";
+    const icon = mode === "sepia" ? "📜" : mode === "night" ? "🌙" : "🌗";
+    const label =
+      mode === "sepia"
+        ? "Режим: Сепия (нажми для режима Ночь)"
+        : mode === "night"
+          ? "Режим: Ночь (нажми для Авто)"
+          : "Режим: Авто (нажми для Сепии)";
+    this.themeBtn.setText(icon);
+    this.themeBtn.setAttr("aria-label", label);
   }
 
   toggleThemeMode() {
+    this.recordReadingActivity();
     const s = this.plugin.settings;
-    s.themeMode = s.themeMode === "sepia" ? "auto" : "sepia";
+    const cur = s.themeMode ?? "auto";
+    s.themeMode = cur === "auto" ? "sepia" : cur === "sepia" ? "night" : "auto";
     this.updateThemeBtnText();
     this.applyStyles();
     this.plugin.requestSaveSettings();
@@ -1937,27 +2221,42 @@ export class EpubView extends FileView {
     }, 140);
   }
 
+  // C4: применение темы («Авто», «Сепия», «Ночь»), полей страницы, выравнивания и переносов через rendition.themes
   applyStyles() {
     if (!this.rendition) return;
     const s = this.plugin.settings;
-    const isSepia = s.themeMode === "sepia";
+    const mode = s.themeMode ?? "auto";
+    const isSepia = mode === "sepia";
+    const isNight = mode === "night";
 
     this.contentEl.toggleClass("my-epub-is-sepia", isSepia);
+    this.contentEl.toggleClass("my-epub-is-night", isNight);
     this.plugin.syncGlobalBodyClasses();
 
     const computed = getComputedStyle(document.body);
     const bg = isSepia
       ? "#f4ecd8"
-      : computed.getPropertyValue("--background-primary").trim() || "#1e1e1e";
+      : isNight
+        ? "#121316"
+        : computed.getPropertyValue("--background-primary").trim() || "#1e1e1e";
     const fg = isSepia
       ? "#3b2f2f"
-      : computed.getPropertyValue("--text-normal").trim() || "#dcddde";
+      : isNight
+        ? "#c9ccd1"
+        : computed.getPropertyValue("--text-normal").trim() || "#dcddde";
     const link = isSepia
       ? "#8b4513"
-      : computed.getPropertyValue("--text-accent").trim() || "#7f6df2";
+      : isNight
+        ? "#8ab4f8"
+        : computed.getPropertyValue("--text-accent").trim() || "#7f6df2";
 
     const fontCss = FONT_MAP[s.fontFamily ?? "serif"];
     const lh = String(s.lineHeight ?? 1.6);
+    const marginPx = Math.max(0, Math.min(64, s.pageMarginPx ?? 12));
+    const alignMode = s.textAlign ?? "default";
+    const alignCss =
+      alignMode === "justify" ? "justify !important" : alignMode === "left" ? "left !important" : "inherit";
+    const hyphensCss = s.hyphens ? "auto !important" : "manual !important";
 
     this.rendition.themes.fontSize(s.fontSize + "%");
     this.rendition.themes.default({
@@ -1966,7 +2265,7 @@ export class EpubView extends FileView {
         "color": `${fg} !important`,
         "font-family": `${fontCss} !important`,
         "line-height": `${lh} !important`,
-        "padding": "0 12px !important",
+        "padding": `0 ${marginPx}px !important`,
         "max-width": "none !important",
         "touch-action": "pan-y !important",
         "-webkit-user-select": "text !important",
@@ -1978,6 +2277,9 @@ export class EpubView extends FileView {
         "font-family": "inherit !important",
         "line-height": "inherit !important",
         "max-width": "none !important",
+        "text-align": alignCss,
+        "-webkit-hyphens": hyphensCss,
+        "hyphens": hyphensCss,
         "-webkit-user-select": "text !important",
         "user-select": "text !important",
       },
@@ -2014,9 +2316,20 @@ export class EpubView extends FileView {
         "color": `${link} !important`,
       },
     });
+
+    // Перерисовываем подсветку при смене темы, чтобы highlightStyles обновил режим наложения для «Ночи» / «Сепии»
+    if (this.bookWords.length > 0 || this.bookQuotes.length > 0) {
+      applyHighlightsToRendition(
+        this.rendition,
+        this.appliedHighlightCfis,
+        this.bookWords,
+        this.bookQuotes
+      );
+    }
   }
 
   setFont(delta: number) {
+    this.recordReadingActivity();
     const s = this.plugin.settings;
     s.fontSize = Math.max(60, Math.min(250, s.fontSize + delta));
     this.applyStylesAndRestore();
@@ -2054,7 +2367,6 @@ export class EpubView extends FileView {
       this.info.setText(`${bmMark}стр. ${page} / ${total} · ${pct}%${chapterLeftSuffix}`);
       this.fsInfoEl?.setText(`${bmMark}${page}/${total} · ${pct}% ⛶`);
     } else {
-      // A5: пока locations.generate ещё считается, сразу показываем процент без блокировки UI
       const fastPct = this.computeFastPercentage(cfi);
       this.info.setText(`${bmMark}~${fastPct}%${chapterLeftSuffix} · считаю стр.…`);
       this.fsInfoEl?.setText(`${bmMark}~${fastPct}% ⛶`);
@@ -2072,6 +2384,7 @@ export class EpubView extends FileView {
       return;
     }
 
+    this.recordReadingActivity();
     this.captureChapterMetricsFromLoc(loc);
     this.stableCfi = cfi;
 
@@ -2095,6 +2408,10 @@ export class EpubView extends FileView {
     this.isGeneratingLocations = false;
     this.navHistory = [];
     this.plugin.syncGlobalBodyClasses();
+    if (this.readingTickTimer !== null) {
+      window.clearInterval(this.readingTickTimer);
+      this.readingTickTimer = null;
+    }
     if (this.resizeTimer) {
       window.clearTimeout(this.resizeTimer);
       this.resizeTimer = null;
@@ -2180,6 +2497,66 @@ class EpubSettingTab extends PluginSettingTab {
           .onChange((val) => {
             this.plugin.settings.quotesFilePath = val.trim() || "Знания/Цитаты из книг.md";
             this.plugin.requestSaveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Тема читалки")
+      .setDesc("Цветовая схема страницы книги")
+      .addDropdown((drop) =>
+        drop
+          .addOption("auto", "Авто (как в Obsidian)")
+          .addOption("sepia", "Сепия")
+          .addOption("night", "Ночь")
+          .setValue(this.plugin.settings.themeMode ?? "auto")
+          .onChange((val) => {
+            this.plugin.settings.themeMode = val as ThemeMode;
+            this.plugin.requestSaveSettings();
+            this.plugin.refreshAllViews();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Поля страницы (px)")
+      .setDesc("Боковые внутренние отступы текста книги (по умолчанию: 12 px)")
+      .addSlider((slider) =>
+        slider
+          .setLimits(0, 48, 2)
+          .setValue(this.plugin.settings.pageMarginPx ?? 12)
+          .setDynamicTooltip()
+          .onChange((val) => {
+            this.plugin.settings.pageMarginPx = val;
+            this.plugin.requestSaveSettings();
+            this.plugin.refreshAllViews();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Выравнивание текста")
+      .setDesc("Выравнивание абзацев книги")
+      .addDropdown((drop) =>
+        drop
+          .addOption("default", "По умолчанию (из книги)")
+          .addOption("justify", "По ширине")
+          .addOption("left", "По левому краю")
+          .setValue(this.plugin.settings.textAlign ?? "default")
+          .onChange((val) => {
+            this.plugin.settings.textAlign = val as TextAlignMode;
+            this.plugin.requestSaveSettings();
+            this.plugin.refreshAllViews();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Автоматические переносы слов")
+      .setDesc("Включить CSS-переносы (hyphens: auto)")
+      .addToggle((toggle) =>
+        toggle
+          .setValue(Boolean(this.plugin.settings.hyphens))
+          .onChange((val) => {
+            this.plugin.settings.hyphens = val;
+            this.plugin.requestSaveSettings();
+            this.plugin.refreshAllViews();
           })
       );
 
@@ -2291,7 +2668,6 @@ export default class MyEpubPlugin extends Plugin {
       }
     });
 
-    // A6: команды палитры через addCommand с checkCallback (только при активном EpubView)
     this.addCommand({
       id: "next-page",
       name: "Следующая страница",
@@ -2327,7 +2703,7 @@ export default class MyEpubPlugin extends Plugin {
 
     this.addCommand({
       id: "open-table-of-contents",
-      name: "Открыть оглавление, закладки и выписанные слова",
+      name: "Открыть оглавление, закладки, слова и поиск",
       checkCallback: (checking: boolean) => {
         const view = this.app.workspace.getActiveViewOfType(EpubView);
         if (!view) return false;
@@ -2404,7 +2780,6 @@ export default class MyEpubPlugin extends Plugin {
     return Object.keys(this.locationsIndex).length;
   }
 
-  // A4: инициализация индекса и миграция старого locationsCache из data.json в отдельные файлы
   async initAndMigrateLocationsCache() {
     const adapter = this.app.vault.adapter;
     const indexPath = this.getLocationsIndexPath();
@@ -2591,9 +2966,12 @@ export default class MyEpubPlugin extends Plugin {
   syncGlobalBodyClasses() {
     const activeView = this.app.workspace.getActiveViewOfType(EpubView);
     const isFs = Boolean(activeView && activeView.isFullscreen);
-    const isSepia = Boolean(activeView && this.settings.themeMode === "sepia");
+    const mode = this.settings.themeMode ?? "auto";
+    const isSepia = Boolean(activeView && mode === "sepia");
+    const isNight = Boolean(activeView && mode === "night");
     document.body.classList.toggle("my-epub-fullscreen", isFs);
     document.body.classList.toggle("my-epub-sepia-bg", isFs && isSepia);
+    document.body.classList.toggle("my-epub-night-bg", isFs && isNight);
   }
 
   async openEpubAt(epubLinkOrPath: string, cfi?: string) {
@@ -2644,6 +3022,7 @@ export default class MyEpubPlugin extends Plugin {
     for (const leaf of leaves) {
       const view = leaf.view;
       if (view instanceof EpubView) {
+        view.updateThemeBtnText();
         view.applyBarPosition();
         view.applySpreadMode(this.settings.spreadMode ?? "none");
         view.applyDesktopWidth(true);
@@ -2678,7 +3057,7 @@ export default class MyEpubPlugin extends Plugin {
   }
 
   onunload() {
-    document.body.classList.remove("my-epub-fullscreen", "my-epub-sepia-bg");
+    document.body.classList.remove("my-epub-fullscreen", "my-epub-sepia-bg", "my-epub-night-bg");
     if (this.saveTimer) {
       window.clearTimeout(this.saveTimer);
       this.saveTimer = null;
