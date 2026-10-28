@@ -1,20 +1,77 @@
-import { App, Modal, Notice, TFile, requestUrl } from "obsidian";
+import { App, DataAdapter, Modal, Notice, TFile, requestUrl } from "obsidian";
 import { NavItem } from "epubjs";
 import type MyEpubPlugin from "./main";
 
 export const EXAMPLE_SEP = " — ";
 const TRANSLATE_PER_POS = 4;
 const TRANSLATE_TIMEOUT_MS = 10000;
+const MAX_TRANSLATION_CACHE = 2000;
+const TRANSLATION_CACHE_DEBOUNCE_MS = 2000;
+const TRANSLATION_CACHE_FILENAME = "translations-cache.json";
 
 export const normStr = (s: string) => String(s ?? "").trim().toLowerCase().replace(/\s+/g, " ");
 export const normText = (s: string) =>
   String(s ?? "").toLowerCase().replace(/[“”"']/g, "").replace(/\s+/g, " ").trim();
-export const wordKey = (s: string) => normText(s).replace(/^(to|a|an|the)\s+/, "");
+
+// B4: лёгкая нормализация окончаний (-s, -es, -ed, -ing, -ly) только для ключа поиска дублей
+function lightStemToken(token: string): string {
+  const w = token.trim();
+  if (w.length < 4) return w;
+
+  if (w.endsWith("ies") && w.length >= 5) {
+    return w.slice(0, -3) + "y";
+  }
+  if (w.endsWith("ly") && w.length >= 5) {
+    return w.slice(0, -2);
+  }
+  if (w.endsWith("ing") && w.length >= 6) {
+    const stem = w.slice(0, -3);
+    const last = stem.charAt(stem.length - 1);
+    const prev = stem.charAt(stem.length - 2);
+    if (stem.length >= 4 && last === prev && /[bdfgklmnprstvz]/.test(last)) {
+      return stem.slice(0, -1);
+    }
+    return stem;
+  }
+  if (w.endsWith("ed") && w.length >= 5) {
+    const stem = w.slice(0, -2);
+    const last = stem.charAt(stem.length - 1);
+    const prev = stem.charAt(stem.length - 2);
+    if (stem.length >= 4 && last === prev && /[bdfgklmnprstvz]/.test(last)) {
+      return stem.slice(0, -1);
+    }
+    return stem;
+  }
+  if (w.endsWith("es") && w.length >= 5) {
+    if (/(ches|shes|xes|zes|sses)$/.test(w)) {
+      return w.slice(0, -2);
+    }
+    return w.slice(0, -1);
+  }
+  if (w.endsWith("s") && !/(ss|us|is)$/.test(w)) {
+    return w.slice(0, -1);
+  }
+  return w;
+}
+
+export const wordKey = (s: string): string => {
+  const base = normText(s).replace(/^(to|a|an|the)\s+/, "");
+  if (!base) return "";
+  return base
+    .split(" ")
+    .filter(Boolean)
+    .map(lightStemToken)
+    .join(" ");
+};
+
 export const cleanExample = (s: string) =>
   String(s ?? "").replace(/\s+/g, " ").replace(/:{2,}/g, ":").replace(/==|\*\*/g, "").trim();
 
 export const encodeInline = (s: string) =>
   String(s ?? "").replace(/\r?\n|\r/g, " ").replace(/\)/g, "⟩").replace(/\(/g, "⟨").trim();
+
+const decodeInline = (s: string) =>
+  String(s ?? "").replace(/⟩/g, ")").replace(/⟨/g, "(").trim();
 
 export function getTodayISO(): string {
   const d = new Date();
@@ -56,7 +113,58 @@ export function cleanSelectedQuote(raw: string): string {
   return String(raw ?? "").replace(/\s+/g, " ").trim();
 }
 
-// Умное извлечение полного предложения из абзаца книги вокруг выделенного слова
+// B3: Защита сокращений (Mr., Dr., U.S., e.g. и инициалов) от ложного разрыва предложения
+const ABBREV_END_REGEX =
+  /(?:^|\s)(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|Mt|vs|etc|fig|vol|ch|pp|no|e\.g|i\.e|U\.S|U\.K|Ph\.D|[A-Z])\.$/i;
+
+function mergeAbbreviationSplits(rawSegments: string[]): string[] {
+  const merged: string[] = [];
+  for (const seg of rawSegments) {
+    const trimmed = seg.trim();
+    if (!trimmed) continue;
+    const prev = merged[merged.length - 1];
+    if (prev && ABBREV_END_REGEX.test(prev)) {
+      merged[merged.length - 1] = `${prev} ${trimmed}`;
+    } else {
+      merged.push(trimmed);
+    }
+  }
+  return merged;
+}
+
+function splitParagraphIntoSentences(paragraph: string): string[] {
+  try {
+    const IntlAny = typeof Intl !== "undefined" ? (Intl as any) : null;
+    if (IntlAny && typeof IntlAny.Segmenter === "function") {
+      const segmenter = new IntlAny.Segmenter("en", { granularity: "sentence" });
+      const rawList = Array.from(segmenter.segment(paragraph), (item: any) =>
+        String(item?.segment ?? "").trim()
+      ).filter(Boolean);
+      if (rawList.length > 0) {
+        return mergeAbbreviationSplits(rawList);
+      }
+    }
+  } catch {
+    // Переходим к запасному варианту
+  }
+
+  // Запасной вариант с маскировкой точек внутри сокращений (Mr., Dr., U.S. и т.д.)
+  const DOT_PLACEHOLDER = "\uE000";
+  const masked = paragraph
+    .replace(
+      /\b(Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|Mt|vs|etc|fig|vol|ch|pp|no)\./gi,
+      `$1${DOT_PLACEHOLDER}`
+    )
+    .replace(/\b(e\.g|i\.e|U\.S|U\.K|Ph\.D)\./gi, (m) => m.replace(/\./g, DOT_PLACEHOLDER))
+    .replace(/\b([A-Z])\.(?=\s+[A-Z])/g, `$1${DOT_PLACEHOLDER}`);
+
+  const matches = masked.match(/[^.!?]+[.!?]+["”»'’)]*|[^.!?]+$/g) || [masked];
+  return matches
+    .map((s) => s.replace(/\uE000/g, ".").trim())
+    .filter(Boolean);
+}
+
+// B3: Умное извлечение полного предложения из абзаца книги вокруг выделенного слова
 export function extractSentenceFromSelection(sel: Selection | null | undefined, word: string): string {
   if (!sel || sel.rangeCount === 0) return "";
   try {
@@ -79,7 +187,7 @@ export function extractSentenceFromSelection(sel: Selection | null | undefined, 
     const paragraph = rawText.replace(/\s+/g, " ").trim();
     if (!paragraph) return "";
 
-    const sentences = paragraph.match(/[^.!?]+[.!?]+["”»'’)]*|[^.!?]+$/g) || [paragraph];
+    const sentences = splitParagraphIntoSentences(paragraph);
     const cleanW = word.trim().toLowerCase();
 
     for (const s of sentences) {
@@ -212,13 +320,116 @@ export async function ensureQuotesFile(app: App, quotesFilePath: string): Promis
   return await app.vault.create(quotesFilePath, initialContent);
 }
 
-// --- Переводчик ---
+// --- B1: Переводчик с постоянным кэшем в отдельном JSON плагина (лимит 2000, ленивая загрузка, debounce) ---
 export interface TranslationGroup {
   pos: string;
   terms: string[];
 }
 
-const translationCache = new Map<string, TranslationGroup[]>();
+interface TranslationCacheRecord {
+  groups: TranslationGroup[];
+  updatedAt: number;
+}
+
+const translationCache = new Map<string, TranslationCacheRecord>();
+let cacheAdapter: DataAdapter | null = null;
+let cacheFilePath = "";
+let cacheLoadedFromDisk = false;
+let cacheLoadPromise: Promise<void> | null = null;
+let cacheSaveTimer: number | null = null;
+
+export function configureTranslationCache(app: App, pluginDir?: string) {
+  cacheAdapter = app.vault.adapter;
+  const dir =
+    pluginDir ||
+    (app as any)?.plugins?.plugins?.["my-epub-reader"]?.manifest?.dir ||
+    `${app.vault.configDir}/plugins/my-epub-reader`;
+  cacheFilePath = `${dir}/${TRANSLATION_CACHE_FILENAME}`;
+}
+
+function resolveCacheAdapterAndPath(): { adapter: DataAdapter; path: string } | null {
+  if (cacheAdapter && cacheFilePath) {
+    return { adapter: cacheAdapter, path: cacheFilePath };
+  }
+  const globalApp: App | undefined =
+    typeof window !== "undefined" ? (window as any).app : undefined;
+  if (globalApp?.vault?.adapter) {
+    configureTranslationCache(globalApp);
+    if (cacheAdapter && cacheFilePath) {
+      return { adapter: cacheAdapter, path: cacheFilePath };
+    }
+  }
+  return null;
+}
+
+async function ensureTranslationCacheLoaded(): Promise<void> {
+  if (cacheLoadedFromDisk) return;
+  if (cacheLoadPromise) return cacheLoadPromise;
+
+  cacheLoadPromise = (async () => {
+    const resolved = resolveCacheAdapterAndPath();
+    if (!resolved) {
+      cacheLoadedFromDisk = true;
+      return;
+    }
+    try {
+      if (await resolved.adapter.exists(resolved.path)) {
+        const raw = await resolved.adapter.read(resolved.path);
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === "object") {
+          const entries = Object.entries(parsed as Record<string, TranslationCacheRecord>);
+          entries.sort((a, b) => (a[1]?.updatedAt ?? 0) - (b[1]?.updatedAt ?? 0));
+          for (const [k, v] of entries) {
+            if (v && Array.isArray(v.groups) && v.groups.length > 0) {
+              translationCache.set(k, {
+                groups: v.groups,
+                updatedAt: typeof v.updatedAt === "number" ? v.updatedAt : Date.now(),
+              });
+            }
+          }
+          pruneTranslationCacheInMemory();
+        }
+      }
+    } catch {
+      // Игнорируем ошибку чтения кэша переводов
+    } finally {
+      cacheLoadedFromDisk = true;
+      cacheLoadPromise = null;
+    }
+  })();
+
+  return cacheLoadPromise;
+}
+
+function pruneTranslationCacheInMemory() {
+  if (translationCache.size <= MAX_TRANSLATION_CACHE) return;
+  const entries = Array.from(translationCache.entries());
+  entries.sort((a, b) => a[1].updatedAt - b[1].updatedAt);
+  const toRemoveCount = translationCache.size - MAX_TRANSLATION_CACHE;
+  for (let i = 0; i < toRemoveCount; i++) {
+    const item = entries[i];
+    if (item) translationCache.delete(item[0]);
+  }
+}
+
+function scheduleSaveTranslationCache() {
+  if (cacheSaveTimer !== null) window.clearTimeout(cacheSaveTimer);
+  cacheSaveTimer = window.setTimeout(async () => {
+    cacheSaveTimer = null;
+    const resolved = resolveCacheAdapterAndPath();
+    if (!resolved) return;
+    try {
+      pruneTranslationCacheInMemory();
+      const obj: Record<string, TranslationCacheRecord> = {};
+      for (const [k, v] of translationCache.entries()) {
+        obj[k] = v;
+      }
+      await resolved.adapter.write(resolved.path, JSON.stringify(obj));
+    } catch {
+      // Игнорируем ошибку фоновой записи кэша
+    }
+  }, TRANSLATION_CACHE_DEBOUNCE_MS);
+}
 
 const DESKTOP_HEADERS: Record<string, string> = {
   "User-Agent":
@@ -279,9 +490,15 @@ export async function fetchTranslations(word: string): Promise<TranslationGroup[
   const cleanWord = String(word ?? "").trim();
   if (!cleanWord) throw new Error("пустой запрос");
 
+  await ensureTranslationCacheLoaded();
+
   const cacheKey = cleanWord.toLowerCase();
   const cached = translationCache.get(cacheKey);
-  if (cached) return cached;
+  if (cached && cached.groups.length > 0) {
+    cached.updatedAt = Date.now();
+    scheduleSaveTranslationCache();
+    return cached.groups;
+  }
 
   const q = encodeURIComponent(cleanWord);
   const endpoints = [
@@ -298,7 +515,9 @@ export async function fetchTranslations(word: string): Promise<TranslationGroup[
       const data = typeof r.json === "object" && r.json !== null ? r.json : JSON.parse(r.text);
       const groups = parseGoogleData(data);
       if (groups.length) {
-        translationCache.set(cacheKey, groups);
+        translationCache.set(cacheKey, { groups, updatedAt: Date.now() });
+        pruneTranslationCacheInMemory();
+        scheduleSaveTranslationCache();
         return groups;
       }
     } catch (e) {
@@ -331,7 +550,9 @@ export async function fetchTranslations(word: string): Promise<TranslationGroup[
     const terms = [...termsSet].slice(0, TRANSLATE_PER_POS);
     if (terms.length) {
       const groups = [{ pos: "перевод", terms }];
-      translationCache.set(cacheKey, groups);
+      translationCache.set(cacheKey, { groups, updatedAt: Date.now() });
+      pruneTranslationCacheInMemory();
+      scheduleSaveTranslationCache();
       return groups;
     }
   } catch (e) {
@@ -389,6 +610,65 @@ function parseExistingWordsForDuplicates(content: string): ExistingWordCard[] {
   }
 
   return result;
+}
+
+// B2: Парсер существующих цитат для проверки дублей внутри выбранной книги
+interface ExistingQuoteRecord {
+  lineNumber: number;
+  text: string;
+  normKey: string;
+  bookTarget: string | null;
+  bookTitleNorm: string;
+}
+
+function parseExistingQuotesForDuplicates(content: string): ExistingQuoteRecord[] {
+  const lines = String(content ?? "").split(/\r?\n/);
+  const result: ExistingQuoteRecord[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = (lines[i] ?? "").trim();
+    if (!line.startsWith("-") || !line.includes("цитата::")) continue;
+
+    const fields: Record<string, string> = {};
+    const fieldRegex = /\(([а-яА-Яa-zA-Z0-9_]+)::\s*([^)]+)\)/g;
+    for (const m of line.matchAll(fieldRegex)) {
+      const k = m[1]?.trim();
+      const v = m[2]?.trim();
+      if (k && v) fields[k] = v;
+    }
+
+    const rawText = fields["цитата"] ? decodeInline(fields["цитата"]) : "";
+    if (!rawText) continue;
+
+    const linkTarget =
+      extractLinkTarget(fields["книга_ссылка"]) || extractLinkTarget(fields["книга"]);
+    const bookTitleNorm = normStr(decodeInline(fields["книга"] || ""));
+
+    result.push({
+      lineNumber: i + 1,
+      text: rawText,
+      normKey: normText(rawText),
+      bookTarget: linkTarget,
+      bookTitleNorm,
+    });
+  }
+
+  return result;
+}
+
+function isQuoteInSelectedBook(q: ExistingQuoteRecord, book: BookNoteInfo | null): boolean {
+  if (!book) return false;
+  if (q.bookTarget) {
+    const cleanTarget = normStr(q.bookTarget.replace(/\.md$/i, ""));
+    if (
+      cleanTarget === normStr(book.fileName) ||
+      cleanTarget === normStr(book.title) ||
+      normStr(q.bookTarget) === normStr(book.path)
+    ) {
+      return true;
+    }
+  }
+  return q.bookTitleNorm !== "" && q.bookTitleNorm === normStr(book.title);
 }
 
 function safeCloseModal(modal: Modal) {
@@ -841,7 +1121,7 @@ export class BookLinkModal extends Modal {
   }
 }
 
-// --- 3. Модальное окно «+ Слово» (с кнопкой контекста "📖 Из книги") ---
+// --- 3. Модальное окно «+ Слово» (B5: cachedRead при открытии, vault.read перед записью) ---
 export class AddWordModal extends Modal {
   plugin: MyEpubPlugin;
   initialWord: string;
@@ -870,6 +1150,7 @@ export class AddWordModal extends Modal {
     this.extractedContextSentence = extractedContextSentence;
     this.preselectedBook = preselectedBook;
     this.allBooks = allBooks;
+    configureTranslationCache(app, plugin.manifest?.dir);
   }
 
   async onOpen() {
@@ -881,7 +1162,8 @@ export class AddWordModal extends Modal {
     const wordsFile = this.resolveWordsFile();
     if (wordsFile) {
       try {
-        const raw = await this.app.vault.read(wordsFile);
+        // B5: используем cachedRead при открытии модального окна
+        const raw = await this.app.vault.cachedRead(wordsFile);
         this.existingCards = parseExistingWordsForDuplicates(raw);
       } catch {
         this.existingCards = [];
@@ -1105,6 +1387,7 @@ export class AddWordModal extends Modal {
       let noticeText = "";
 
       try {
+        // B5: перед записью читаем актуальное содержимое через vault.read
         const freshContent = await this.app.vault.read(targetWordsFile);
         const freshCards = parseExistingWordsForDuplicates(freshContent);
         const k = wordKey(en);
@@ -1204,13 +1487,14 @@ export class AddWordModal extends Modal {
   }
 }
 
-// --- 4. Модальное окно «+ Цитата» ---
+// --- 4. Модальное окно «+ Цитата» (B2: проверка дублей по normText внутри выбранной книги) ---
 export class AddQuoteModal extends Modal {
   plugin: MyEpubPlugin;
   initialQuote: string;
   capturedCfi: string | null;
   preselectedBook: BookNoteInfo | null;
   allBooks: BookNoteInfo[];
+  existingQuotes: ExistingQuoteRecord[] = [];
 
   constructor(
     app: App,
@@ -1229,11 +1513,22 @@ export class AddQuoteModal extends Modal {
     this.allBooks = allBooks;
   }
 
-  onOpen() {
+  async onOpen() {
     (this as any).shouldRestoreSelection = false;
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("my-epub-modal");
+
+    const quotesPath = (this.plugin.settings.quotesFilePath || "Знания/Цитаты из книг.md").trim();
+    const existingFile = this.app.vault.getAbstractFileByPath(quotesPath);
+    if (existingFile instanceof TFile) {
+      try {
+        const raw = await this.app.vault.cachedRead(existingFile);
+        this.existingQuotes = parseExistingQuotesForDuplicates(raw);
+      } catch {
+        this.existingQuotes = [];
+      }
+    }
 
     const head = contentEl.createDiv("my-epub-word-head");
     head.createSpan({ cls: "my-epub-word-title", text: "✍️ Новая цитата из книги" });
@@ -1267,11 +1562,62 @@ export class AddQuoteModal extends Modal {
     });
     textArea.value = this.initialQuote;
 
+    const dupHint = contentEl.createDiv("my-epub-dup-hint");
+    dupHint.style.display = "none";
+
     const btnRow = contentEl.createDiv("my-epub-modal-row-end");
     const saveBtn = btnRow.createEl("button", {
       cls: "mod-cta my-epub-modal-btn",
       text: "+ Сохранить цитату",
     });
+
+    let pendingQuoteKey: string | null = null;
+    const resetPending = () => {
+      pendingQuoteKey = null;
+      saveBtn.setText("+ Сохранить цитату");
+    };
+
+    const getChosenBook = (): BookNoteInfo | null => {
+      return this.allBooks.find((b) => b.path === bookSel.value) || this.preselectedBook;
+    };
+
+    const showDupQuotes = (dups: ExistingQuoteRecord[]) => {
+      dupHint.empty();
+      if (!dups.length) {
+        dupHint.style.display = "none";
+        return;
+      }
+      dupHint.style.display = "block";
+      dups.slice(0, 2).forEach((q) => {
+        const preview = q.text.length > 75 ? q.text.slice(0, 74) + "…" : q.text;
+        dupHint.createDiv({
+          text: `⚠️ Такая цитата уже есть в этой книге (строка ${q.lineNumber}): «${preview}»`,
+        });
+      });
+    };
+
+    const checkDuplicatesLive = () => {
+      const chosenBook = getChosenBook();
+      const nk = normText(textArea.value);
+      if (!nk || !chosenBook) {
+        showDupQuotes([]);
+        return;
+      }
+      const matches = this.existingQuotes.filter(
+        (q) => q.normKey === nk && isQuoteInSelectedBook(q, chosenBook)
+      );
+      showDupQuotes(matches);
+    };
+    checkDuplicatesLive();
+
+    textArea.oninput = () => {
+      resetPending();
+      checkDuplicatesLive();
+    };
+    bookSel.onchange = () => {
+      resetPending();
+      checkDuplicatesLive();
+    };
 
     const submitQuote = async () => {
       if (saveBtn.disabled) return;
@@ -1282,7 +1628,7 @@ export class AddQuoteModal extends Modal {
         return;
       }
 
-      const chosenBook = this.allBooks.find((b) => b.path === bookSel.value) || this.preselectedBook;
+      const chosenBook = getChosenBook();
       if (!chosenBook) {
         new Notice("Сначала выбери книгу.");
         return;
@@ -1291,10 +1637,29 @@ export class AddQuoteModal extends Modal {
       saveBtn.disabled = true;
       let savedOk = false;
       try {
-        const quotesPath = (this.plugin.settings.quotesFilePath || "Знания/Цитаты из книг.md").trim();
         const qFile = await ensureQuotesFile(this.app, quotesPath);
-        const todayISO = getTodayISO();
+        const freshContent = await this.app.vault.read(qFile);
+        const freshQuotes = parseExistingQuotesForDuplicates(freshContent);
+        const nk = normText(textVal);
+        const sameInBook = freshQuotes.filter(
+          (q) => q.normKey === nk && isQuoteInSelectedBook(q, chosenBook)
+        );
 
+        if (sameInBook.length > 0) {
+          showDupQuotes(sameInBook);
+          const pk = `${chosenBook.path}|${nk}`;
+          if (pendingQuoteKey !== pk) {
+            pendingQuoteKey = pk;
+            saveBtn.setText("Всё равно добавить");
+            new Notice(
+              "Эта цитата уже есть в выбранной книге. Нажми ещё раз, если всё равно хочешь сохранить."
+            );
+            saveBtn.disabled = false;
+            return;
+          }
+        }
+
+        const todayISO = getTodayISO();
         const cleanLink = encodeInline(`[[${chosenBook.path}]]`);
         const cleanTitle = encodeInline(chosenBook.title);
         const cleanText = encodeInline(textVal);

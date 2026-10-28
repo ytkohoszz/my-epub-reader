@@ -670,3 +670,94 @@ body.my-epub-fullscreen .my-epub-wrap {
   border-left: 3px solid var(--text-accent);
   background: var(--background-modifier-hover);
 }
+/* Всплывающая карточка по тапу на подсвеченное слово или цитату (Релиз B6) */
+.my-epub-hl-card {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: calc(4.4rem + env(safe-area-inset-bottom, 0px));
+  width: min(460px, calc(100vw - 24px));
+  padding: 0.75rem 0.9rem;
+  border-radius: 12px;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-top: 3px solid var(--interactive-accent);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  z-index: 40;
+  box-sizing: border-box;
+}
+
+.my-epub-hl-card.my-epub-hl-card-quote {
+  border-top-color: var(--text-warning, #e5a158);
+}
+
+.my-epub.my-epub-is-sepia .my-epub-hl-card {
+  background: #f4ecd8;
+  color: #3b2f2f;
+  border-color: #d8ccb0;
+}
+
+.my-epub-hl-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.my-epub-hl-card-title {
+  font-size: 0.98rem;
+  font-weight: 700;
+  color: var(--text-normal);
+  word-break: break-word;
+}
+
+.my-epub.my-epub-is-sepia .my-epub-hl-card-title,
+.my-epub.my-epub-is-sepia .my-epub-hl-card-body {
+  color: #3b2f2f;
+}
+
+.my-epub-hl-card-close {
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0 0.4rem;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.my-epub-hl-card-body {
+  font-size: 0.94rem;
+  font-weight: 600;
+  color: var(--text-accent);
+  line-height: 1.38;
+  word-break: break-word;
+}
+
+.my-epub-hl-card-example {
+  font-size: 0.82rem;
+  font-style: italic;
+  color: var(--text-muted);
+  line-height: 1.35;
+}
+
+.my-epub.my-epub-is-sepia .my-epub-hl-card-example {
+  color: #5c4b37;
+}
+
+.my-epub-hl-card-actions {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin-top: 0.2rem;
+}
+
+.my-epub-hl-card-btn {
+  min-height: 34px;
+  padding: 0 0.75rem;
+  font-size: 0.82rem;
+  border-radius: 8px;
+  cursor: pointer;
+}

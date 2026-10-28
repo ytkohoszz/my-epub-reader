@@ -4,6 +4,7 @@ import {
   BookNoteInfo,
   EXAMPLE_SEP,
   TranslationGroup,
+  configureTranslationCache,
   extractLinkTarget,
   fetchTranslations,
   normStr,
@@ -32,6 +33,12 @@ export interface BookQuoteEntry {
   cfi: string | null;
   lineNumber: number;
 }
+
+// Контекст последнего обновления аннотаций для перехода из всплывающей карточки в файл заметки
+let activeAnnotationsApp: App | null = null;
+let activeWordsFilePath = "Words Cards";
+let activeQuotesFilePath = "Знания/Цитаты из книг.md";
+let activeHighlightPopoverCleanup: (() => void) | null = null;
 
 const decodeInline = (s: string) =>
   String(s ?? "").replace(/⟩/g, ")").replace(/⟨/g, "(").trim();
@@ -71,18 +78,55 @@ function resolveVaultFile(app: App, rawPath: string): TFile | null {
   return dest instanceof TFile ? dest : null;
 }
 
+async function openVaultFileAtLine(app: App | null, rawPath: string, lineNumberOneBased: number) {
+  const targetApp = app ?? (typeof window !== "undefined" ? (window as any).app : null);
+  if (!targetApp) return;
+
+  const file = resolveVaultFile(targetApp, rawPath);
+  if (!file) {
+    new Notice(`Файл «${rawPath}» не найден.`);
+    return;
+  }
+
+  const leaf = targetApp.workspace.getLeaf(false);
+  await leaf.openFile(file);
+
+  const lineIdx = Math.max(0, (lineNumberOneBased || 1) - 1);
+  window.setTimeout(() => {
+    try {
+      const view: any = targetApp.workspace.activeLeaf?.view;
+      const editor = view?.editor;
+      if (editor) {
+        editor.setCursor({ line: lineIdx, ch: 0 });
+        editor.scrollIntoView(
+          { from: { line: lineIdx, ch: 0 }, to: { line: lineIdx, ch: 0 } },
+          true
+        );
+        editor.focus();
+      }
+    } catch {
+      // Игнорируем
+    }
+  }, 120);
+}
+
 export async function loadBookAnnotationsFromVault(
   app: App,
   linkedBook: BookNoteInfo | null,
   wordsFilePath: string,
   quotesFilePath: string
 ): Promise<{ words: BookWordEntry[]; quotes: BookQuoteEntry[] }> {
+  activeAnnotationsApp = app;
+  activeWordsFilePath = wordsFilePath || "Words Cards";
+  activeQuotesFilePath = quotesFilePath || "Знания/Цитаты из книг.md";
+  configureTranslationCache(app);
+
   if (!linkedBook) return { words: [], quotes: [] };
 
   const words: BookWordEntry[] = [];
   const quotes: BookQuoteEntry[] = [];
 
-  const wordsFile = resolveVaultFile(app, wordsFilePath || "Words Cards");
+  const wordsFile = resolveVaultFile(app, activeWordsFilePath);
   if (wordsFile) {
     try {
       // cachedRead не перечитывает большой файл с диска при каждом обновлении
@@ -138,7 +182,7 @@ export async function loadBookAnnotationsFromVault(
     }
   }
 
-  const quotesFile = resolveVaultFile(app, quotesFilePath || "Знания/Цитаты из книг.md");
+  const quotesFile = resolveVaultFile(app, activeQuotesFilePath);
   if (quotesFile) {
     try {
       const content = await app.vault.cachedRead(quotesFile);
@@ -195,12 +239,157 @@ function highlightStyles(fill: string, opacity: string): Record<string, string> 
   };
 }
 
+function closeActiveHighlightPopover() {
+  if (activeHighlightPopoverCleanup) {
+    const fn = activeHighlightPopoverCleanup;
+    activeHighlightPopoverCleanup = null;
+    try {
+      fn();
+    } catch {
+      // Игнорируем
+    }
+  }
+}
+
+// B6: Всплывающая карточка по тапу на подсветку (перевод, пример, кнопки 🔊 и «Перейти в карточку», закрытие тапом вне)
+function showHighlightPopoverCard(
+  rendition: Rendition,
+  opts: {
+    type: "word" | "quote";
+    title: string;
+    translationOrQuote: string;
+    exampleOrDate: string;
+    speakWord?: string;
+    targetFilePath: string;
+    lineNumber: number;
+  }
+) {
+  closeActiveHighlightPopover();
+
+  const hostEl =
+    (document.querySelector(".view-content.my-epub") as HTMLElement | null) ||
+    document.body;
+
+  const cardEl = hostEl.createDiv({
+    cls:
+      "my-epub-hl-card " +
+      (opts.type === "word" ? "my-epub-hl-card-word" : "my-epub-hl-card-quote"),
+  });
+  cardEl.addEventListener("pointerdown", (e) => e.stopPropagation());
+  cardEl.addEventListener("touchstart", (e) => e.stopPropagation(), { passive: true });
+  cardEl.addEventListener("click", (e) => e.stopPropagation());
+
+  const head = cardEl.createDiv("my-epub-hl-card-head");
+  head.createSpan({
+    cls: "my-epub-hl-card-title",
+    text: opts.type === "word" ? `🇬🇧 ${opts.title}` : `💬 ${opts.title}`,
+  });
+
+  const closeBtn = head.createEl("button", {
+    cls: "my-epub-hl-card-close",
+    text: "✕",
+    attr: { type: "button", "aria-label": "Закрыть карточку" },
+  });
+  closeBtn.onclick = () => closeActiveHighlightPopover();
+
+  const mainBody = cardEl.createDiv("my-epub-hl-card-body");
+  mainBody.setText(opts.translationOrQuote);
+
+  if (opts.exampleOrDate) {
+    cardEl.createDiv({
+      cls: "my-epub-hl-card-example",
+      text: opts.exampleOrDate,
+    });
+  }
+
+  const actions = cardEl.createDiv("my-epub-hl-card-actions");
+
+  if (opts.speakWord) {
+    const wordToSpeak = opts.speakWord;
+    const ttsBtn = actions.createEl("button", {
+      cls: "my-epub-hl-card-btn",
+      text: "🔊 Озвучить",
+      attr: { type: "button" },
+    });
+    ttsBtn.onclick = () => speakEnglishText(wordToSpeak);
+  }
+
+  const openLineBtn = actions.createEl("button", {
+    cls: "mod-cta my-epub-hl-card-btn",
+    text: `📄 Перейти в карточку (стр. ${opts.lineNumber})`,
+    attr: { type: "button" },
+  });
+  openLineBtn.onclick = () => {
+    closeActiveHighlightPopover();
+    void openVaultFileAtLine(activeAnnotationsApp, opts.targetFilePath, opts.lineNumber);
+  };
+
+  // Закрытие тапом вне карточки (как в главном окне Obsidian, так и внутри iframe книги)
+  const cleanupTargets: Array<() => void> = [];
+  const onOutsideTap = (ev: Event) => {
+    const target = ev.target as Node | null;
+    if (target && cardEl.contains(target)) return;
+    closeActiveHighlightPopover();
+  };
+
+  const timerId = window.setTimeout(() => {
+    document.addEventListener("pointerdown", onOutsideTap, true);
+    document.addEventListener("touchstart", onOutsideTap, { capture: true, passive: true });
+    cleanupTargets.push(() => {
+      document.removeEventListener("pointerdown", onOutsideTap, true);
+      document.removeEventListener("touchstart", onOutsideTap, true);
+    });
+
+    try {
+      const contentsList: any[] = (rendition as any)?.getContents?.() || [];
+      for (const c of contentsList) {
+        const doc: Document | undefined = c?.document;
+        if (doc) {
+          doc.addEventListener("pointerdown", onOutsideTap, true);
+          doc.addEventListener("touchstart", onOutsideTap, { capture: true, passive: true });
+          cleanupTargets.push(() => {
+            doc.removeEventListener("pointerdown", onOutsideTap, true);
+            doc.removeEventListener("touchstart", onOutsideTap, true);
+          });
+        }
+      }
+    } catch {
+      // Игнорируем
+    }
+  }, 60);
+
+  const onRelocatedClose = () => closeActiveHighlightPopover();
+  try {
+    rendition.on("relocated", onRelocatedClose);
+  } catch {
+    // Игнорируем
+  }
+
+  activeHighlightPopoverCleanup = () => {
+    window.clearTimeout(timerId);
+    for (const fn of cleanupTargets) {
+      try {
+        fn();
+      } catch {
+        // Игнорируем
+      }
+    }
+    try {
+      rendition.off?.("relocated", onRelocatedClose);
+    } catch {
+      // Игнорируем
+    }
+    cardEl.remove();
+  };
+}
+
 export function applyHighlightsToRendition(
   rendition: Rendition | null,
   appliedCfis: Set<string>,
   words: BookWordEntry[],
   quotes: BookQuoteEntry[]
 ) {
+  closeActiveHighlightPopover();
   if (!rendition || !rendition.annotations) return;
 
   for (const oldCfi of appliedCfis) {
@@ -220,7 +409,15 @@ export function applyHighlightsToRendition(
         {},
         () => {
           speakEnglishText(w.word);
-          new Notice(`🇬🇧 ${w.word} — ${w.back}`, 4500);
+          showHighlightPopoverCard(rendition, {
+            type: "word",
+            title: w.word,
+            translationOrQuote: w.back,
+            exampleOrDate: w.example ? `«${w.example}»` : "",
+            speakWord: w.word,
+            targetFilePath: activeWordsFilePath,
+            lineNumber: w.lineNumber,
+          });
         },
         "my-epub-hl-word",
         highlightStyles("#599ed6", "0.28")
@@ -238,8 +435,14 @@ export function applyHighlightsToRendition(
         q.cfi,
         {},
         () => {
-          const shortText = q.text.length > 140 ? q.text.slice(0, 140) + "…" : q.text;
-          new Notice(`💬 «${shortText}»`, 5000);
+          showHighlightPopoverCard(rendition, {
+            type: "quote",
+            title: "Цитата",
+            translationOrQuote: `«${q.text}»`,
+            exampleOrDate: q.date ? `Дата: ${q.date}` : "",
+            targetFilePath: activeQuotesFilePath,
+            lineNumber: q.lineNumber,
+          });
         },
         "my-epub-hl-quote",
         highlightStyles("#e5a158", "0.30")
@@ -261,6 +464,7 @@ export class QuickTranslateModal extends Modal {
     (this as any).shouldRestoreSelection = false;
     this.textToTranslate = textToTranslate;
     this.onSaveToVocab = onSaveToVocab;
+    configureTranslationCache(app);
   }
 
   safeClose() {
@@ -655,7 +859,6 @@ export class BookNavModal extends Modal {
       row.style.paddingLeft = `${0.75 + level * 1.25}rem`;
       row.setText(label);
 
-      // Отмечаем первую подходящую главу как текущую
       if (!this.currentTocMarked && current && label.toLowerCase() === current) {
         row.addClass("is-current");
         this.currentTocMarked = true;
