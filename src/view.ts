@@ -51,7 +51,7 @@ import {
   computeFastPercentage,
   flushBookYamlProgress,
   generateLocationsInBackground,
-  getCfiFromPageNumber,
+  getCfiFromPageNumberSafe,
   reconcilePositionWithBookNote,
   recordPageTransitionForPace,
   resolveInitialCfiBeforeRender,
@@ -64,7 +64,7 @@ import {
 } from "./gestures";
 import type MyEpubPlugin from "./main";
 
-// Модальное окно настроек вида вместо системного Menu (исключает сдвиг индексов на iPad/iPhone)
+// Модальное окно настроек вида и чтения вместо системного Menu
 class AppearanceModal extends Modal {
   view: EpubView;
 
@@ -93,7 +93,7 @@ class AppearanceModal extends Modal {
     label: string,
     options: Array<{ id: T; label: string }>,
     isActive: (id: T) => boolean,
-    onPick: (id: T) => void
+    onPick: (id: T, chosenLabel: string) => void
   ) {
     const sec = parent.createDiv("my-epub-appear-section");
     sec.createDiv({ cls: "my-epub-appear-label", text: label });
@@ -107,7 +107,7 @@ class AppearanceModal extends Modal {
       btn.onclick = (e) => {
         e.preventDefault();
         e.stopPropagation();
-        onPick(opt.id);
+        onPick(opt.id, opt.label);
         this.render();
       };
     }
@@ -119,7 +119,7 @@ class AppearanceModal extends Modal {
     contentEl.empty();
     contentEl.addClass("my-epub-modal", "my-epub-appear-modal");
 
-    const ver = this.view.plugin.manifest?.version || "0.2.7";
+    const ver = this.view.plugin.manifest?.version || "0.2.8";
     const head = contentEl.createDiv("my-epub-word-head");
     head.createSpan({
       cls: "my-epub-word-title",
@@ -138,7 +138,6 @@ class AppearanceModal extends Modal {
     const curPos = s.barPosition ?? "bottom";
     const curWidth = s.desktopWidthPct ?? 85;
 
-    // 1. Быстрые действия с книгой и текущей страницей
     const topActions = contentEl.createDiv("my-epub-appear-actions");
 
     const linkedLabel = this.view.linkedBookNote
@@ -179,7 +178,6 @@ class AppearanceModal extends Modal {
       };
     }
 
-    // 2. Размер шрифта
     const fontSec = contentEl.createDiv("my-epub-appear-section");
     fontSec.createDiv({
       cls: "my-epub-appear-label",
@@ -204,6 +202,7 @@ class AppearanceModal extends Modal {
       s.fontSize = 120;
       this.view.applyStylesAndRestore();
       this.view.plugin.requestSaveSettings();
+      new Notice("Размер шрифта: 120%");
       this.render();
     };
     const incFontBtn = fontRow.createEl("button", {
@@ -216,7 +215,6 @@ class AppearanceModal extends Modal {
       this.render();
     };
 
-    // 3. Тема чтения
     this.renderChipGroup<ThemeMode>(
       contentEl,
       "Цветовая тема",
@@ -226,15 +224,15 @@ class AppearanceModal extends Modal {
         { id: "night", label: "🌙 Ночь" },
       ],
       (id) => curTheme === id,
-      (id) => {
+      (id, label) => {
         s.themeMode = id;
         this.view.updateThemeBtnText();
         this.view.applyStyles();
         this.view.plugin.requestSaveSettings();
+        new Notice(`Тема: ${label}`);
       }
     );
 
-    // 4. Книжный разворот (1 или 2 страницы)
     this.renderChipGroup<SpreadMode>(
       contentEl,
       "Книжный разворот",
@@ -243,13 +241,13 @@ class AppearanceModal extends Modal {
         { id: "auto", label: "📖 2 страницы (на широком экране)" },
       ],
       (id) => curSpread === id,
-      (id) => {
+      (id, label) => {
         this.view.applySpreadMode(id);
         this.view.plugin.requestSaveSettings();
+        new Notice(`Разворот: ${label}`);
       }
     );
 
-    // 5. Гарнитура шрифта
     this.renderChipGroup<FontFamily>(
       contentEl,
       "Шрифт",
@@ -260,14 +258,14 @@ class AppearanceModal extends Modal {
         { id: "mono", label: "Моноширинный" },
       ],
       (id) => curFont === id,
-      (id) => {
+      (id, label) => {
         s.fontFamily = id;
         this.view.applyStylesAndRestore();
         this.view.plugin.requestSaveSettings();
+        new Notice(`Шрифт: ${label}`);
       }
     );
 
-    // 6. Межстрочный интервал
     this.renderChipGroup<number>(
       contentEl,
       "Межстрочный интервал",
@@ -277,14 +275,14 @@ class AppearanceModal extends Modal {
         { id: 1.85, label: "Свободный (1.85)" },
       ],
       (id) => Math.abs(curLh - id) < 0.05,
-      (id) => {
+      (id, label) => {
         s.lineHeight = id;
         this.view.applyStylesAndRestore();
         this.view.plugin.requestSaveSettings();
+        new Notice(`Интервал: ${label}`);
       }
     );
 
-    // 7. Поля страницы
     this.renderChipGroup<number>(
       contentEl,
       "Боковые поля страницы",
@@ -294,14 +292,14 @@ class AppearanceModal extends Modal {
         { id: 28, label: "Широкие (28 px)" },
       ],
       (id) => Math.abs(curMargin - id) <= 2,
-      (id) => {
+      (id, label) => {
         s.pageMarginPx = id;
         this.view.applyStylesAndRestore();
         this.view.plugin.requestSaveSettings();
+        new Notice(`Поля: ${label}`);
       }
     );
 
-    // 8. Выравнивание и переносы
     const alignSec = contentEl.createDiv("my-epub-appear-section");
     alignSec.createDiv({ cls: "my-epub-appear-label", text: "Выравнивание и переносы" });
     const alignRow = alignSec.createDiv("my-epub-appear-chips");
@@ -323,6 +321,7 @@ class AppearanceModal extends Modal {
         s.textAlign = al.id;
         this.view.applyStylesAndRestore();
         this.view.plugin.requestSaveSettings();
+        new Notice(`Выравнивание: ${al.label}`);
         this.render();
       };
     }
@@ -338,10 +337,10 @@ class AppearanceModal extends Modal {
       s.hyphens = !curHyphens;
       this.view.applyStylesAndRestore();
       this.view.plugin.requestSaveSettings();
+      new Notice(s.hyphens ? "Переносы слов включены" : "Переносы слов выключены");
       this.render();
     };
 
-    // 9. Ширина колонки на ПК
     if (Platform.isDesktop) {
       this.renderChipGroup<number>(
         contentEl,
@@ -353,27 +352,28 @@ class AppearanceModal extends Modal {
           { id: 100, label: "100%" },
         ],
         (id) => Math.abs(curWidth - id) < 3,
-        (id) => {
+        (id, label) => {
           s.desktopWidthPct = id;
           this.view.applyDesktopWidth(true);
           this.view.plugin.requestSaveSettings();
+          new Notice(`Ширина (ПК): ${label}`);
         }
       );
     }
 
-    // 10. Анимация листания и положение панели
     this.renderChipGroup<PageAnimation>(
       contentEl,
       "Анимация перелистывания",
       [
         { id: "slide", label: "Слайд" },
-        { id: "fade", label: "Затухание" },
+        { id: "fade", label: "Мягкое затухание" },
         { id: "none", label: "Выключена" },
       ],
       (id) => curAnim === id,
-      (id) => {
+      (id, label) => {
         s.pageAnimation = id;
         this.view.plugin.requestSaveSettings();
+        new Notice(`Анимация: ${label}`);
       }
     );
 
@@ -385,12 +385,13 @@ class AppearanceModal extends Modal {
         { id: "top", label: "Сверху" },
       ],
       (id) => curPos === id,
-      (id) => {
+      (id, label) => {
         s.barPosition = id;
         this.view.isResizing = true;
         this.view.applyBarPosition();
         this.view.plugin.requestSaveSettings();
         this.view.triggerResize(true);
+        new Notice(`Панель: ${label}`);
       }
     );
 
@@ -953,7 +954,7 @@ export class EpubView extends FileView {
       this.totalPagesNum,
       this.getChapterSummaryText(),
       (targetPage) => {
-        const targetCfi = getCfiFromPageNumber(this, targetPage);
+        const targetCfi = getCfiFromPageNumberSafe(this, targetPage);
         if (targetCfi) {
           this.pushNavHistory();
           void this.jumpToCfi(targetCfi, false);
@@ -1547,6 +1548,7 @@ export class EpubView extends FileView {
     s.fontSize = Math.max(60, Math.min(250, s.fontSize + delta));
     this.applyStylesAndRestore();
     this.plugin.requestSaveSettings();
+    new Notice(`Размер шрифта: ${s.fontSize}%`);
   }
 
   updateProgressLabels(cfi: string) {

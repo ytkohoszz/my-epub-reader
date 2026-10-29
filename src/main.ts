@@ -189,7 +189,7 @@ export default class MyEpubPlugin extends Plugin {
               updatedAt: entry.updatedAt || Date.now(),
             };
           } catch {
-            // Игнорируем ошибку переноса отдельного файла
+            // Игнорируем
           }
         }
       }

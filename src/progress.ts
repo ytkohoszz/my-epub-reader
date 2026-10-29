@@ -103,12 +103,7 @@ export function computeFastPercentage(
 
 export function captureChapterMetricsFromLoc(view: EpubView, loc: EpubRelocatedEvent) {
   const disp = loc?.start?.displayed;
-  if (
-    disp &&
-    typeof disp.page === "number" &&
-    typeof disp.total === "number" &&
-    disp.total > 0
-  ) {
+  if (disp && typeof disp.page === "number" && typeof disp.total === "number" && disp.total > 0) {
     view.chapterPageCurrent = disp.page;
     view.chapterPageTotal = disp.total;
   } else {
@@ -138,9 +133,7 @@ export function buildChapterSummaryText(view: EpubView): string {
   if (view.chapterPageCurrent !== null && view.chapterPageTotal !== null) {
     const leftInChapter = Math.max(0, view.chapterPageTotal - view.chapterPageCurrent);
     if (leftInChapter === 0) {
-      parts.push(
-        `последняя страница главы (${view.chapterPageCurrent}/${view.chapterPageTotal})`
-      );
+      parts.push(`последняя страница главы (${view.chapterPageCurrent}/${view.chapterPageTotal})`);
     } else {
       const etaChapter =
         hasPaceData && avgTurnMs > 0
@@ -166,9 +159,10 @@ export function buildChapterSummaryText(view: EpubView): string {
   return parts.join(" · ");
 }
 
-export function getCfiFromPageNumber(view: EpubView, page: number): string | null {
+export function getCfiFromPageNumberSafe(view: EpubView, page: number): string | null {
   if (!view.book || !view.totalPagesNum || view.totalPagesNum <= 0) return null;
-  const clampedPage = Math.max(1, Math.min(view.totalPagesNum, Math.round(page)));
+  const total = view.totalPagesNum;
+  const clampedPage = Math.max(1, Math.min(total, Math.round(page)));
   const idx = clampedPage - 1;
   const locs = view.book.locations as unknown as EpubLocationsExtended;
 
@@ -185,8 +179,12 @@ export function getCfiFromPageNumber(view: EpubView, page: number): string | nul
   if (typeof fromArr === "string" && fromArr.length > 0) return fromArr;
 
   return view.book.locations.cfiFromPercentage(
-    Math.max(0, Math.min(1, idx / Math.max(1, view.totalPagesNum)))
+    Math.max(0, Math.min(1, idx / Math.max(1, total)))
   );
+}
+
+export function getCfiFromPageNumber(view: EpubView, page: number): string | null {
+  return getCfiFromPageNumberSafe(view, page);
 }
 
 export function resolveInitialCfiBeforeRender(
@@ -272,7 +270,7 @@ export async function generateLocationsInBackground(
         await view.plugin.saveLocationsCacheFile(file.path, sig, serialized);
       }
     } catch {
-      // Игнорируем ошибку сохранения кэша
+      // Игнорируем
     }
 
     if (currentLoadId !== view.loadId || !view.book || !view.rendition) return;
@@ -342,13 +340,13 @@ export async function reconcilePositionWithBookNote(
         const cfiIdx = Number(view.book!.locations.locationFromCfi(yamlCfi));
         const cfiPage = Math.max(1, Math.min(view.totalPagesNum!, cfiIdx + 1));
         if (Math.abs(cfiPage - yamlPage) >= 1) {
-          return getCfiFromPageNumber(view, yamlPage);
+          return getCfiFromPageNumberSafe(view, yamlPage);
         }
       }
       return yamlCfi;
     }
     if (yamlPage !== null) {
-      return getCfiFromPageNumber(view, yamlPage);
+      return getCfiFromPageNumberSafe(view, yamlPage);
     }
     return null;
   };
@@ -371,7 +369,7 @@ export async function reconcilePositionWithBookNote(
       return;
     }
     if (yamlPage !== null && yamlPage !== localPage) {
-      const targetCfi = getCfiFromPageNumber(view, yamlPage);
+      const targetCfi = getCfiFromPageNumberSafe(view, yamlPage);
       if (targetCfi && currentLoadId === view.loadId) {
         const nowIso = new Date().toISOString();
         view.stableCfi = targetCfi;

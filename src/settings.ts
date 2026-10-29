@@ -1,4 +1,4 @@
-import { App, PluginSettingTab, Setting, Notice } from "obsidian";
+import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import type { BookmarkItem } from "./highlights";
 import type MyEpubPlugin from "./main";
 
@@ -33,7 +33,7 @@ export interface NavHistoryItem {
   page: number;
 }
 
-// D2: Локальные интерфейсы для объектов epub.js, у которых неполные официальные типы в d.ts
+// Локальные интерфейсы для внутренних структур epub.js
 export interface EpubDisplayedPage {
   page: number;
   total: number;
@@ -135,40 +135,25 @@ export function getErrorMessage(err: unknown): string {
 }
 
 export function migrateSettings(raw: unknown): Settings {
-  const source =
-    raw && typeof raw === "object" ? (raw as Partial<Settings>) : {};
+  const source = raw && typeof raw === "object" ? (raw as Partial<Settings>) : {};
   const s: Settings = Object.assign({}, DEFAULTS, source);
 
   if (!s.progress || typeof s.progress !== "object") s.progress = {};
-  if (!s.progressUpdatedAt || typeof s.progressUpdatedAt !== "object") {
-    s.progressUpdatedAt = {};
-  }
-  if (typeof s.fontSize !== "number" || isNaN(s.fontSize)) {
-    s.fontSize = DEFAULTS.fontSize;
-  }
+  if (!s.progressUpdatedAt || typeof s.progressUpdatedAt !== "object") s.progressUpdatedAt = {};
+  if (typeof s.fontSize !== "number" || isNaN(s.fontSize)) s.fontSize = DEFAULTS.fontSize;
   if (!s.bookmarks || typeof s.bookmarks !== "object") s.bookmarks = {};
-  if (!s.booksFolder || typeof s.booksFolder !== "string") {
-    s.booksFolder = DEFAULTS.booksFolder;
-  }
-  if (!s.wordsFilePath || typeof s.wordsFilePath !== "string") {
-    s.wordsFilePath = DEFAULTS.wordsFilePath;
-  }
-  if (!s.quotesFilePath || typeof s.quotesFilePath !== "string") {
-    s.quotesFilePath = DEFAULTS.quotesFilePath;
-  }
-  if (s.spreadMode !== "auto" && s.spreadMode !== "none") {
-    s.spreadMode = "none";
-  }
-  if (s.themeMode !== "auto" && s.themeMode !== "sepia" && s.themeMode !== "night") {
-    s.themeMode = "auto";
-  }
-  if (typeof s.pageMarginPx !== "number" || isNaN(s.pageMarginPx)) {
-    s.pageMarginPx = DEFAULTS.pageMarginPx;
-  }
-  if (s.textAlign !== "default" && s.textAlign !== "justify" && s.textAlign !== "left") {
-    s.textAlign = "default";
-  }
+  if (!s.booksFolder || typeof s.booksFolder !== "string") s.booksFolder = DEFAULTS.booksFolder;
+  if (!s.wordsFilePath || typeof s.wordsFilePath !== "string") s.wordsFilePath = DEFAULTS.wordsFilePath;
+  if (!s.quotesFilePath || typeof s.quotesFilePath !== "string") s.quotesFilePath = DEFAULTS.quotesFilePath;
+  if (s.spreadMode !== "auto" && s.spreadMode !== "none") s.spreadMode = "none";
+  if (s.themeMode !== "auto" && s.themeMode !== "sepia" && s.themeMode !== "night") s.themeMode = "auto";
+  if (typeof s.pageMarginPx !== "number" || isNaN(s.pageMarginPx)) s.pageMarginPx = DEFAULTS.pageMarginPx;
+  if (s.textAlign !== "default" && s.textAlign !== "justify" && s.textAlign !== "left") s.textAlign = "default";
   if (typeof s.hyphens !== "boolean") s.hyphens = false;
+  if (s.pageAnimation !== "slide" && s.pageAnimation !== "fade" && s.pageAnimation !== "none") {
+    s.pageAnimation = "slide";
+  }
+  if (s.barPosition !== "bottom" && s.barPosition !== "top") s.barPosition = "bottom";
   return s;
 }
 

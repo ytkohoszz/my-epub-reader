@@ -1,7 +1,7 @@
 {
 	"id": "my-epub-reader",
 	"name": "Моя читалка EPUB",
-	"version": "0.2.7",
+	"version": "0.2.8",
 	"minAppVersion": "1.5.0",
 	"description": "Читалка EPUB с номером страницы и процентом",
 	"author": "Mersinho",
