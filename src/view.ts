@@ -1,6 +1,7 @@
 import {
+  App,
   FileView,
-  Menu,
+  Modal,
   Notice,
   Platform,
   TFile,
@@ -51,7 +52,7 @@ import {
   flushBookYamlProgress,
   generateLocationsInBackground,
   getCfiFromPageNumber,
-   reconcilePositionWithBookNote,
+  reconcilePositionWithBookNote,
   recordPageTransitionForPace,
   resolveInitialCfiBeforeRender,
   tryLoadCachedLocations,
@@ -62,6 +63,331 @@ import {
   syncSelectionFromAllIframes,
 } from "./gestures";
 import type MyEpubPlugin from "./main";
+
+// Модальное окно настроек вида и чтения вместо системного Menu (исправляет сдвиг индексов на iPad/iPhone)
+class AppearanceModal extends Modal {
+  view: EpubView;
+
+  constructor(app: App, view: EpubView) {
+    super(app);
+    (this as unknown as { shouldRestoreSelection?: boolean }).shouldRestoreSelection = false;
+    this.view = view;
+  }
+
+  safeClose() {
+    try {
+      (this as unknown as { shouldRestoreSelection?: boolean }).shouldRestoreSelection = false;
+      this.close();
+    } catch {
+      // Игнорируем
+    }
+  }
+
+  onOpen() {
+    (this as unknown as { shouldRestoreSelection?: boolean }).shouldRestoreSelection = false;
+    this.render();
+  }
+
+  private renderChipGroup<T extends string | number>(
+    parent: HTMLElement,
+    label: string,
+    options: Array<{ id: T; label: string }>,
+    isActive: (id: T) => boolean,
+    onPick: (id: T) => void
+  ) {
+    const sec = parent.createDiv("my-epub-appear-section");
+    sec.createDiv({ cls: "my-epub-appear-label", text: label });
+    const row = sec.createDiv("my-epub-appear-chips");
+    for (const opt of options) {
+      const btn = row.createEl("button", {
+        cls: "my-epub-appear-chip" + (isActive(opt.id) ? " is-active" : ""),
+        text: opt.label,
+        attr: { type: "button" },
+      });
+      btn.onclick = () => {
+        onPick(opt.id);
+        this.render();
+      };
+    }
+  }
+
+  render() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("my-epub-modal", "my-epub-appear-modal");
+
+    const head = contentEl.createDiv("my-epub-word-head");
+    head.createSpan({ cls: "my-epub-word-title", text: "🔤 Вид и настройки чтения" });
+
+    const s = this.view.plugin.settings;
+    const curTheme = s.themeMode ?? "auto";
+    const curSpread = s.spreadMode ?? "none";
+    const curFont = s.fontFamily ?? "serif";
+    const curLh = s.lineHeight ?? 1.6;
+    const curMargin = s.pageMarginPx ?? 12;
+    const curAlign = s.textAlign ?? "default";
+    const curHyphens = Boolean(s.hyphens);
+    const curAnim = s.pageAnimation ?? "slide";
+    const curPos = s.barPosition ?? "bottom";
+    const curWidth = s.desktopWidthPct ?? 85;
+
+    // 1. Быстрые действия с книгой и текущей страницей
+    const topActions = contentEl.createDiv("my-epub-appear-actions");
+
+    const linkedLabel = this.view.linkedBookNote
+      ? `📖 Книга: ${this.view.linkedBookNote.title} (сменить…)`
+      : "📖 Привязать заметку книги…";
+    const linkBookBtn = topActions.createEl("button", {
+      cls: "my-epub-appear-action-btn",
+      text: linkedLabel,
+      attr: { type: "button" },
+    });
+    linkBookBtn.onclick = () => {
+      this.safeClose();
+      this.view.openBookLinkModal();
+    };
+
+    const isBm = this.view.isCurrentPageBookmarked();
+    const bmBtn = topActions.createEl("button", {
+      cls: "my-epub-appear-action-btn" + (isBm ? " is-active" : ""),
+      text: isBm
+        ? "🔖 Удалить закладку со страницы"
+        : "🔖 Добавить закладку на странице",
+      attr: { type: "button" },
+    });
+    bmBtn.onclick = () => {
+      this.view.toggleBookmarkOnCurrentPage();
+      this.render();
+    };
+
+    if (this.view.totalPagesNum && this.view.totalPagesNum > 0) {
+      const jumpBtn = topActions.createEl("button", {
+        cls: "my-epub-appear-action-btn",
+        text: `🧭 Перейти к странице (сейчас ${this.view.currentPageNum ?? 1} из ${this.view.totalPagesNum})…`,
+        attr: { type: "button" },
+      });
+      jumpBtn.onclick = () => {
+        this.safeClose();
+        this.view.openJumpModal();
+      };
+    }
+
+    // 2. Размер шрифта
+    const fontSec = contentEl.createDiv("my-epub-appear-section");
+    fontSec.createDiv({
+      cls: "my-epub-appear-label",
+      text: `Размер шрифта: ${s.fontSize}%`,
+    });
+    const fontRow = fontSec.createDiv("my-epub-appear-chips");
+    const decFontBtn = fontRow.createEl("button", {
+      cls: "my-epub-appear-chip",
+      text: "A− Уменьшить",
+      attr: { type: "button" },
+    });
+    decFontBtn.onclick = () => {
+      this.view.setFont(-10);
+      this.render();
+    };
+    const resetFontBtn = fontRow.createEl("button", {
+      cls: "my-epub-appear-chip" + (s.fontSize === 120 ? " is-active" : ""),
+      text: "120% (Сброс)",
+      attr: { type: "button" },
+    });
+    resetFontBtn.onclick = () => {
+      s.fontSize = 120;
+      this.view.applyStylesAndRestore();
+      this.view.plugin.requestSaveSettings();
+      this.render();
+    };
+    const incFontBtn = fontRow.createEl("button", {
+      cls: "my-epub-appear-chip",
+      text: "A+ Увеличить",
+      attr: { type: "button" },
+    });
+    incFontBtn.onclick = () => {
+      this.view.setFont(10);
+      this.render();
+    };
+
+    // 3. Тема чтения
+    this.renderChipGroup<ThemeMode>(
+      contentEl,
+      "Цветовая тема",
+      [
+        { id: "auto", label: "🌗 Авто (Obsidian)" },
+        { id: "sepia", label: "📜 Сепия" },
+        { id: "night", label: "🌙 Ночь" },
+      ],
+      (id) => curTheme === id,
+      (id) => {
+        s.themeMode = id;
+        this.view.updateThemeBtnText();
+        this.view.applyStyles();
+        this.view.plugin.requestSaveSettings();
+      }
+    );
+
+    // 4. Книжный разворот (1 или 2 страницы)
+    this.renderChipGroup<SpreadMode>(
+      contentEl,
+      "Книжный разворот",
+      [
+        { id: "none", label: "📄 1 страница" },
+        { id: "auto", label: "📖 2 страницы (на широком экране)" },
+      ],
+      (id) => curSpread === id,
+      (id) => {
+        this.view.applySpreadMode(id);
+        this.view.plugin.requestSaveSettings();
+      }
+    );
+
+    // 5. Гарнитура шрифта
+    this.renderChipGroup<FontFamily>(
+      contentEl,
+      "Шрифт",
+      [
+        { id: "serif", label: "Georgia (С засечками)" },
+        { id: "sans", label: "Без засечек" },
+        { id: "default", label: "Из книги" },
+        { id: "mono", label: "Моноширинный" },
+      ],
+      (id) => curFont === id,
+      (id) => {
+        s.fontFamily = id;
+        this.view.applyStylesAndRestore();
+        this.view.plugin.requestSaveSettings();
+      }
+    );
+
+    // 6. Межстрочный интервал
+    this.renderChipGroup<number>(
+      contentEl,
+      "Межстрочный интервал",
+      [
+        { id: 1.35, label: "Плотный (1.35)" },
+        { id: 1.6, label: "Комфортный (1.6)" },
+        { id: 1.85, label: "Свободный (1.85)" },
+      ],
+      (id) => Math.abs(curLh - id) < 0.05,
+      (id) => {
+        s.lineHeight = id;
+        this.view.applyStylesAndRestore();
+        this.view.plugin.requestSaveSettings();
+      }
+    );
+
+    // 7. Поля страницы
+    this.renderChipGroup<number>(
+      contentEl,
+      "Боковые поля страницы",
+      [
+        { id: 6, label: "Узкие (6 px)" },
+        { id: 12, label: "Стандартные (12 px)" },
+        { id: 28, label: "Широкие (28 px)" },
+      ],
+      (id) => Math.abs(curMargin - id) <= 2,
+      (id) => {
+        s.pageMarginPx = id;
+        this.view.applyStylesAndRestore();
+        this.view.plugin.requestSaveSettings();
+      }
+    );
+
+    // 8. Выравнивание и переносы
+    const alignSec = contentEl.createDiv("my-epub-appear-section");
+    alignSec.createDiv({ cls: "my-epub-appear-label", text: "Выравнивание и переносы" });
+    const alignRow = alignSec.createDiv("my-epub-appear-chips");
+
+    const aligns: Array<{ id: TextAlignMode; label: string }> = [
+      { id: "default", label: "По умолчанию" },
+      { id: "justify", label: "По ширине" },
+      { id: "left", label: "По левому краю" },
+    ];
+    for (const al of aligns) {
+      const btn = alignRow.createEl("button", {
+        cls: "my-epub-appear-chip" + (curAlign === al.id ? " is-active" : ""),
+        text: al.label,
+        attr: { type: "button" },
+      });
+      btn.onclick = () => {
+        s.textAlign = al.id;
+        this.view.applyStylesAndRestore();
+        this.view.plugin.requestSaveSettings();
+        this.render();
+      };
+    }
+
+    const hyphBtn = alignRow.createEl("button", {
+      cls: "my-epub-appear-chip" + (curHyphens ? " is-active" : ""),
+      text: curHyphens ? "✓ Переносы слов" : "Переносы слов",
+      attr: { type: "button" },
+    });
+    hyphBtn.onclick = () => {
+      s.hyphens = !curHyphens;
+      this.view.applyStylesAndRestore();
+      this.view.plugin.requestSaveSettings();
+      this.render();
+    };
+
+    // 9. Ширина колонки на ПК
+    if (Platform.isDesktop) {
+      this.renderChipGroup<number>(
+        contentEl,
+        "Ширина текста (ПК)",
+        [
+          { id: 65, label: "65%" },
+          { id: 75, label: "75%" },
+          { id: 85, label: "85%" },
+          { id: 100, label: "100%" },
+        ],
+        (id) => Math.abs(curWidth - id) < 3,
+        (id) => {
+          s.desktopWidthPct = id;
+          this.view.applyDesktopWidth(true);
+          this.view.plugin.requestSaveSettings();
+        }
+      );
+    }
+
+    // 10. Анимация листания и положение панели
+    this.renderChipGroup<PageAnimation>(
+      contentEl,
+      "Анимация перелистывания",
+      [
+        { id: "slide", label: "Слайд" },
+        { id: "fade", label: "Затухание" },
+        { id: "none", label: "Выключена" },
+      ],
+      (id) => curAnim === id,
+      (id) => {
+        s.pageAnimation = id;
+        this.view.plugin.requestSaveSettings();
+      }
+    );
+
+    this.renderChipGroup<BarPosition>(
+      contentEl,
+      "Положение панели кнопок",
+      [
+        { id: "bottom", label: "Снизу" },
+        { id: "top", label: "Сверху" },
+      ],
+      (id) => curPos === id,
+      (id) => {
+        s.barPosition = id;
+        this.view.isResizing = true;
+        this.view.applyBarPosition();
+        this.view.plugin.requestSaveSettings();
+        this.view.triggerResize(true);
+      }
+    );
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
 
 export class EpubView extends FileView {
   plugin: MyEpubPlugin;
@@ -413,7 +739,7 @@ export class EpubView extends FileView {
       this.themeBtn.onclick = () => this.toggleThemeMode();
       this.fsBtn.onclick = () => this.toggleFullscreen();
       tocBtn.onclick = () => this.openToc();
-      fontBtn.onclick = (e) => this.openTypographyMenu(e);
+      fontBtn.onclick = () => this.openTypographyMenu();
 
       this.rendition.on("relocated", (loc: EpubRelocatedEvent) =>
         this.onRelocated(file, loc)
@@ -955,248 +1281,10 @@ export class EpubView extends FileView {
     }).open();
   }
 
-  openTypographyMenu(e: MouseEvent) {
+  openTypographyMenu() {
     this.recordReadingActivity();
-    const menu = new Menu();
-    const s = this.plugin.settings;
-    const curTheme = s.themeMode ?? "auto";
-    const curFont = s.fontFamily ?? "serif";
-    const curLh = s.lineHeight ?? 1.6;
-    const curMargin = s.pageMarginPx ?? 12;
-    const curAlign = s.textAlign ?? "default";
-    const curHyphens = Boolean(s.hyphens);
-    const curAnim = s.pageAnimation ?? "slide";
-    const curPos = s.barPosition ?? "bottom";
-    const curSpread = s.spreadMode ?? "none";
-    const curWidth = s.desktopWidthPct ?? 85;
-
-    const linkedLabel = this.linkedBookNote
-      ? `📖 Книга: ${this.linkedBookNote.title} (сменить…)`
-      : "📖 Привязать заметку книги…";
-
-    menu.addItem((item) =>
-      item.setTitle(linkedLabel).onClick(() => {
-        this.openBookLinkModal();
-      })
-    );
-
-    menu.addItem((item) =>
-      item
-        .setTitle(
-          this.isCurrentPageBookmarked()
-            ? "🔖 Удалить закладку с текущей страницы"
-            : "🔖 Добавить закладку на этой странице"
-        )
-        .onClick(() => {
-          this.toggleBookmarkOnCurrentPage();
-        })
-    );
-
-    if (this.totalPagesNum && this.totalPagesNum > 0) {
-      menu.addItem((item) =>
-        item.setTitle(`🧭 Перейти к странице (1–${this.totalPagesNum})…`).onClick(() => {
-          this.openJumpModal();
-        })
-      );
-    }
-
-    menu.addSeparator();
-
-    const themes: { id: ThemeMode; label: string }[] = [
-      { id: "auto", label: "Тема: Авто (как в Obsidian)" },
-      { id: "sepia", label: "Тема: 📜 Сепия" },
-      { id: "night", label: "Тема: 🌙 Ночь" },
-    ];
-    for (const tm of themes) {
-      menu.addItem((item) =>
-        item
-          .setTitle(tm.label)
-          .setChecked(curTheme === tm.id)
-          .onClick(() => {
-            s.themeMode = tm.id;
-            this.updateThemeBtnText();
-            this.applyStyles();
-            this.plugin.requestSaveSettings();
-          })
-      );
-    }
-
-    menu.addSeparator();
-
-    const spreads: { id: SpreadMode; label: string }[] = [
-      { id: "none", label: "Разворот: 1 страница" },
-      { id: "auto", label: "Разворот: 2 страницы (на широком экране)" },
-    ];
-
-    for (const sp of spreads) {
-      menu.addItem((item) =>
-        item
-          .setTitle(sp.label)
-          .setChecked(curSpread === sp.id)
-          .onClick(() => {
-            this.applySpreadMode(sp.id);
-            this.plugin.requestSaveSettings();
-          })
-      );
-    }
-
-    menu.addSeparator();
-
-    const fonts: { id: FontFamily; label: string }[] = [
-      { id: "serif", label: "Шрифт: С засечками (Georgia)" },
-      { id: "sans", label: "Шрифт: Без засечек (Системный)" },
-      { id: "default", label: "Шрифт: Из файла книги" },
-      { id: "mono", label: "Шрифт: Моноширинный" },
-    ];
-
-    for (const f of fonts) {
-      menu.addItem((item) =>
-        item
-          .setTitle(f.label)
-          .setChecked(curFont === f.id)
-          .onClick(() => {
-            s.fontFamily = f.id;
-            this.applyStylesAndRestore();
-            this.plugin.requestSaveSettings();
-          })
-      );
-    }
-
-    menu.addSeparator();
-
-    const lineHeights = [
-      { val: 1.35, label: "Интервал: Плотный (1.35)" },
-      { val: 1.6, label: "Интервал: Комфортный (1.6)" },
-      { val: 1.85, label: "Интервал: Свободный (1.85)" },
-    ];
-
-    for (const lh of lineHeights) {
-      menu.addItem((item) =>
-        item
-          .setTitle(lh.label)
-          .setChecked(Math.abs(curLh - lh.val) < 0.05)
-          .onClick(() => {
-            s.lineHeight = lh.val;
-            this.applyStylesAndRestore();
-            this.plugin.requestSaveSettings();
-          })
-      );
-    }
-
-    menu.addSeparator();
-
-    const margins = [
-      { val: 6, label: "Поля страницы: Узкие (6 px)" },
-      { val: 12, label: "Поля страницы: Стандартные (12 px)" },
-      { val: 28, label: "Поля страницы: Широкие (28 px)" },
-    ];
-    for (const mg of margins) {
-      menu.addItem((item) =>
-        item
-          .setTitle(mg.label)
-          .setChecked(Math.abs(curMargin - mg.val) <= 2)
-          .onClick(() => {
-            s.pageMarginPx = mg.val;
-            this.applyStylesAndRestore();
-            this.plugin.requestSaveSettings();
-          })
-      );
-    }
-
-    const aligns: { id: TextAlignMode; label: string }[] = [
-      { id: "default", label: "Выравнивание: По умолчанию" },
-      { id: "justify", label: "Выравнивание: По ширине" },
-      { id: "left", label: "Выравнивание: По левому краю" },
-    ];
-    for (const al of aligns) {
-      menu.addItem((item) =>
-        item
-          .setTitle(al.label)
-          .setChecked(curAlign === al.id)
-          .onClick(() => {
-            s.textAlign = al.id;
-            this.applyStylesAndRestore();
-            this.plugin.requestSaveSettings();
-          })
-      );
-    }
-
-    menu.addItem((item) =>
-      item
-        .setTitle("Переносы слов (Hyphens)")
-        .setChecked(curHyphens)
-        .onClick(() => {
-          s.hyphens = !curHyphens;
-          this.applyStylesAndRestore();
-          this.plugin.requestSaveSettings();
-        })
-    );
-
-    if (Platform.isDesktop) {
-      menu.addSeparator();
-      const widths = [
-        { val: 65, label: "Ширина (ПК): Узкая (65%)" },
-        { val: 75, label: "Ширина (ПК): Средняя (75%)" },
-        { val: 85, label: "Ширина (ПК): Широкая (85%)" },
-        { val: 100, label: "Ширина (ПК): На всю ширину (100%)" },
-      ];
-      for (const w of widths) {
-        menu.addItem((item) =>
-          item
-            .setTitle(w.label)
-            .setChecked(Math.abs(curWidth - w.val) < 3)
-            .onClick(() => {
-              s.desktopWidthPct = w.val;
-              this.applyDesktopWidth(true);
-              this.plugin.requestSaveSettings();
-            })
-        );
-      }
-    }
-
-    menu.addSeparator();
-
-    const anims: { id: PageAnimation; label: string }[] = [
-      { id: "slide", label: "Анимация: Слайд" },
-      { id: "fade", label: "Анимация: Мягкое затухание" },
-      { id: "none", label: "Анимация: Выключена" },
-    ];
-
-    for (const a of anims) {
-      menu.addItem((item) =>
-        item
-          .setTitle(a.label)
-          .setChecked(curAnim === a.id)
-          .onClick(() => {
-            s.pageAnimation = a.id;
-            this.plugin.requestSaveSettings();
-          })
-      );
-    }
-
-    menu.addSeparator();
-
-    const positions: { id: BarPosition; label: string }[] = [
-      { id: "bottom", label: "Панель: Снизу" },
-      { id: "top", label: "Панель: Сверху" },
-    ];
-
-    for (const p of positions) {
-      menu.addItem((item) =>
-        item
-          .setTitle(p.label)
-          .setChecked(curPos === p.id)
-          .onClick(() => {
-            s.barPosition = p.id;
-            this.isResizing = true;
-            this.applyBarPosition();
-            this.plugin.requestSaveSettings();
-            this.triggerResize(true);
-          })
-      );
-    }
-
-    menu.showAtMouseEvent(e);
+    this.prepareMainWindowFocusBeforeModal();
+    new AppearanceModal(this.app, this).open();
   }
 
   isCurrentPageBookmarked(): boolean {

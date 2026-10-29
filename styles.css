@@ -854,3 +854,71 @@ body.my-epub-fullscreen.my-epub-night-bg .workspace-leaf-content {
     min-height: 44px;
   }
 }
+/* Окно настроек вида AppearanceModal по кнопке 🔤 (исправляет баг мобильного Menu на iPad/iPhone) */
+.my-epub-appear-modal {
+  max-height: 78vh;
+  overflow-y: auto;
+  padding-right: 0.2rem;
+}
+
+.my-epub-appear-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.my-epub-appear-action-btn {
+  width: 100%;
+  min-height: 42px;
+  padding: 0.45rem 0.75rem;
+  font-size: 0.88rem;
+  font-weight: 600;
+  text-align: left;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.my-epub-appear-action-btn.is-active {
+  border: 1px solid var(--interactive-accent) !important;
+  color: var(--interactive-accent) !important;
+}
+
+.my-epub-appear-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding: 0.6rem 0.75rem;
+  border-radius: 8px;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+}
+
+.my-epub-appear-label {
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.my-epub-appear-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.my-epub-appear-chip {
+  flex: 1 1 auto;
+  min-height: 40px;
+  padding: 0.3rem 0.7rem;
+  font-size: 0.84rem;
+  font-weight: 600;
+  border-radius: 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.my-epub-appear-chip.is-active {
+  background: var(--interactive-accent) !important;
+  color: var(--text-on-accent) !important;
+}
