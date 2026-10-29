@@ -1,9 +1,9 @@
 {
-  "id": "my-epub-reader",
-  "name": "Моя читалка EPUB",
-  "version": "0.2.4",
-  "minAppVersion": "1.5.0",
-  "description": "Читалка EPUB с номером страницы и процентом",
-  "author": "Mersinho",
-  "isDesktopOnly": false
+	"id": "my-epub-reader",
+	"name": "Моя читалка EPUB",
+	"version": "0.2.5",
+	"minAppVersion": "1.5.0",
+	"description": "Читалка EPUB с номером страницы и процентом",
+	"author": "Mersinho",
+	"isDesktopOnly": false
 }
