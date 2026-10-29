@@ -64,7 +64,7 @@ import {
 } from "./gestures";
 import type MyEpubPlugin from "./main";
 
-// Модальное окно настроек вида и чтения вместо системного Menu (исправляет сдвиг индексов на iPad/iPhone)
+// Модальное окно настроек вида вместо системного Menu (исключает сдвиг индексов на iPad/iPhone)
 class AppearanceModal extends Modal {
   view: EpubView;
 
@@ -104,7 +104,9 @@ class AppearanceModal extends Modal {
         text: opt.label,
         attr: { type: "button" },
       });
-      btn.onclick = () => {
+      btn.onclick = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
         onPick(opt.id);
         this.render();
       };
@@ -113,11 +115,16 @@ class AppearanceModal extends Modal {
 
   render() {
     const { contentEl } = this;
+    const prevScrollTop = contentEl.scrollTop;
     contentEl.empty();
     contentEl.addClass("my-epub-modal", "my-epub-appear-modal");
 
+    const ver = this.view.plugin.manifest?.version || "0.2.7";
     const head = contentEl.createDiv("my-epub-word-head");
-    head.createSpan({ cls: "my-epub-word-title", text: "🔤 Вид и настройки чтения" });
+    head.createSpan({
+      cls: "my-epub-word-title",
+      text: `🔤 Вид и настройки чтения (${ver})`,
+    });
 
     const s = this.view.plugin.settings;
     const curTheme = s.themeMode ?? "auto";
@@ -310,7 +317,9 @@ class AppearanceModal extends Modal {
         text: al.label,
         attr: { type: "button" },
       });
-      btn.onclick = () => {
+      btn.onclick = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
         s.textAlign = al.id;
         this.view.applyStylesAndRestore();
         this.view.plugin.requestSaveSettings();
@@ -323,7 +332,9 @@ class AppearanceModal extends Modal {
       text: curHyphens ? "✓ Переносы слов" : "Переносы слов",
       attr: { type: "button" },
     });
-    hyphBtn.onclick = () => {
+    hyphBtn.onclick = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
       s.hyphens = !curHyphens;
       this.view.applyStylesAndRestore();
       this.view.plugin.requestSaveSettings();
@@ -382,6 +393,8 @@ class AppearanceModal extends Modal {
         this.view.triggerResize(true);
       }
     );
+
+    contentEl.scrollTop = prevScrollTop;
   }
 
   onClose() {
