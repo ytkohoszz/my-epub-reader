@@ -451,6 +451,9 @@ export class EpubView extends FileView {
   progressPersistenceBlocked = false;
   pendingOpenCfi: string | null = null;
   navigationInFlight = false;
+  activeBookFile: TFile | null = null;
+  isClosing = false;
+  private closingTask: Promise<void> | null = null;
   private navigationRevision = 0;
   private navigationQueue: Promise<unknown> = Promise.resolve();
   private yamlWriteQueue: Promise<void> = Promise.resolve();
@@ -547,12 +550,17 @@ export class EpubView extends FileView {
 
   async onLoadFile(file: TFile) {
     this.ensureWorkspaceEventsRegistered();
-    await this.flushYamlProgress();
+    if (this.closingTask) await this.closingTask;
+    else if (this.book && this.activeBookFile) await this.finishReading();
+    else await this.flushYamlProgress();
     this.cleanupView();
+    this.isClosing = false;
+    this.closingTask = null;
+    this.activeBookFile = file;
     const currentLoadId = ++this.loadId;
 
     await this.plugin.reloadSettingsFromDisk();
-    if (currentLoadId !== this.loadId) return;
+    if (currentLoadId !== this.loadId || this.isClosing) return;
 
     const root = this.contentEl;
     root.empty();
@@ -746,7 +754,7 @@ export class EpubView extends FileView {
 
     try {
       const data = await this.app.vault.readBinary(file);
-      if (currentLoadId !== this.loadId) return;
+      if (currentLoadId !== this.loadId || this.isClosing) return;
 
       if (!data || data.byteLength === 0) {
         throw new Error("Файл книги пуст (0 байт).");
@@ -780,7 +788,7 @@ export class EpubView extends FileView {
       try {
         await this.rendition.display(this.stableCfi || undefined);
       } catch {
-        if (currentLoadId !== this.loadId || !this.rendition) return;
+        if (currentLoadId !== this.loadId || this.isClosing || !this.rendition) return;
         if (this.stableCfi) {
           this.progressPersistenceBlocked = true;
           new Notice("Сохранённая позиция недоступна. Открыто начало книги без перезаписи прогресса; выбери нужную страницу.");
@@ -789,7 +797,7 @@ export class EpubView extends FileView {
         await this.rendition.display();
       }
 
-      if (currentLoadId !== this.loadId) return;
+      if (currentLoadId !== this.loadId || this.isClosing) return;
 
       this.lastBoxWidth = this.boxEl.clientWidth;
       this.lastBoxHeight = this.boxEl.clientHeight;
@@ -797,12 +805,12 @@ export class EpubView extends FileView {
       this.startReadingTimer();
 
       await this.book.ready;
-      if (currentLoadId !== this.loadId || !this.book) return;
+      if (currentLoadId !== this.loadId || this.isClosing || !this.book) return;
 
       try {
         const bookExt = this.book as unknown as EpubBookExtended;
         const meta = await bookExt.loaded?.metadata;
-        if (currentLoadId !== this.loadId) return;
+        if (currentLoadId !== this.loadId || this.isClosing) return;
         if (meta?.title) this.bookTitleMeta = String(meta.title).trim();
         if (meta?.creator) this.bookAuthorMeta = String(meta.creator).trim();
       } catch {
@@ -811,32 +819,30 @@ export class EpubView extends FileView {
 
       this.trySilentResolveLinkedBookNote(file);
       await this.refreshBookHighlights();
-      if (currentLoadId !== this.loadId || !this.book || !this.rendition) return;
+      if (currentLoadId !== this.loadId || this.isClosing || !this.book || !this.rendition) return;
 
       const loadedFromCache = await tryLoadCachedLocations(this, file, currentLoadId);
-      if (currentLoadId !== this.loadId || !this.book || !this.rendition) return;
+      if (currentLoadId !== this.loadId || this.isClosing || !this.book || !this.rendition) return;
 
       const rendExt = this.rendition as unknown as EpubRenditionExtended;
       const cur = rendExt.currentLocation?.();
-      if (cur?.start?.cfi) {
+      if (!this.navigationInFlight && cur?.start?.cfi) {
         captureChapterMetricsFromLoc(this, cur);
-        this.stableCfi = cur.start.cfi;
-        this.updateProgressLabels(cur.start.cfi);
+        if (!this.stableCfi || this.userHasNavigated) this.stableCfi = cur.start.cfi;
+        this.updateProgressLabels(this.stableCfi);
       }
 
       if (loadedFromCache) {
         await reconcilePositionWithBookNote(this, file, currentLoadId);
-        if (currentLoadId !== this.loadId) return;
-        this.isInitialLoadDone = true;
-        if (!this.navigationInFlight) this.ExplicitCfiJumpPending = false;
-        this.requestYamlProgressSync();
+        if (currentLoadId !== this.loadId || this.isClosing) return;
+        this.finishInitialPositionRestore();
       } else {
         this.isGeneratingLocations = true;
         if (this.stableCfi) this.updateProgressLabels(this.stableCfi);
         void generateLocationsInBackground(this, file, currentLoadId);
       }
     } catch (err: unknown) {
-      if (currentLoadId !== this.loadId) return;
+      if (currentLoadId !== this.loadId || this.isClosing) return;
       console.error("MyEpubPlugin error loading file:", err);
       this.showError(file.name, getErrorMessage(err));
     }
@@ -1001,6 +1007,7 @@ export class EpubView extends FileView {
   }
 
   private async navigateTo(target: string, recordHistory = false): Promise<boolean> {
+    if (this.isClosing) return false;
     const rendition = this.rendition;
     const file = this.file;
     if (!rendition || !file) {
@@ -1105,10 +1112,28 @@ export class EpubView extends FileView {
     ).open();
   }
 
+  finishInitialPositionRestore() {
+    if (this.isClosing) return;
+    this.isInitialLoadDone = true;
+    this.recordReadingActivity();
+    if (!this.navigationInFlight) this.ExplicitCfiJumpPending = false;
+    const file = this.activeBookFile ?? this.file;
+    const cfi = toNavigationCfi(this.stableCfi);
+    if (file && cfi && !this.progressPersistenceBlocked && !this.navigationInFlight) {
+      // Merely reopening must keep the chosen anchor and its original timestamp.
+      const savedAt = this.lastLocalPositionSavedAt ||
+        this.plugin.settings.progressUpdatedAt?.[file.path] || new Date().toISOString();
+      this.lastLocalPositionSavedAt = savedAt;
+      this.plugin.setLocalBookProgress(file.path, cfi, savedAt);
+    }
+    this.requestYamlProgressSync();
+  }
+
   requestYamlProgressSync() {
-    if (!this.isInitialLoadDone || this.progressPersistenceBlocked) return;
-    if (!this.linkedBookNote || !this.file) return;
-    if (this.linkedBookNote.linkedEpubPath !== this.file.path) return;
+    if (!this.isInitialLoadDone || this.progressPersistenceBlocked || this.isClosing) return;
+    const file = this.activeBookFile ?? this.file;
+    if (!this.linkedBookNote || !file) return;
+    if (this.linkedBookNote.linkedEpubPath !== file.path) return;
     if (!this.stableCfi) return;
 
     this.pendingYamlSync = true;
@@ -1285,7 +1310,7 @@ export class EpubView extends FileView {
   }
 
   turnPage(dir: "next" | "prev") {
-    if (!this.rendition || this.ExplicitCfiJumpPending) return;
+    if (!this.rendition || this.ExplicitCfiJumpPending || this.isClosing) return;
     this.navigationRevision++;
     this.userHasNavigated = true;
     this.progressPersistenceBlocked = false;
@@ -1382,7 +1407,7 @@ export class EpubView extends FileView {
   }
 
   triggerResize(force = false) {
-    if (!this.boxEl || !this.rendition || this.ExplicitCfiJumpPending) return;
+    if (!this.boxEl || !this.rendition || this.ExplicitCfiJumpPending || this.isClosing) return;
 
     if (!force) {
       if (document.querySelector(".modal-container")) return;
@@ -1484,7 +1509,7 @@ export class EpubView extends FileView {
   }
 
   applyStylesAndRestore() {
-    if (!this.rendition) return;
+    if (!this.rendition || this.isClosing) return;
     if (this.ExplicitCfiJumpPending) {
       const loadId = this.loadId;
       void this.navigationQueue.then(() => {
@@ -1679,11 +1704,17 @@ export class EpubView extends FileView {
   }
 
   onRelocated(file: TFile, loc: EpubRelocatedEvent) {
-    if (this.file?.path !== file.path) return;
+    if (this.isClosing || (this.activeBookFile ?? this.file)?.path !== file.path) return;
+    if (!this.containerEl.isConnected) return;
+    if (this.boxEl && (!this.boxEl.isConnected ||
+        this.boxEl.clientWidth <= 0 || this.boxEl.clientHeight <= 0)) return;
     const cfi = loc?.start?.cfi;
     if (!cfi || !this.book) return;
 
     if (this.isResizing || this.ExplicitCfiJumpPending) return;
+    // Opening, font reflow and delayed startup reports are not reading
+    // navigation. Preserve the resume anchor until an actual navigation action.
+    if (!this.userHasNavigated) return;
 
     this.recordReadingActivity();
     captureChapterMetricsFromLoc(this, loc);
@@ -1693,14 +1724,9 @@ export class EpubView extends FileView {
       this.updateProgressLabels(cfi);
       return;
     }
-    if (this.isInitialLoadDone || this.userHasNavigated) {
-      const nowIso = new Date().toISOString();
-      this.lastLocalPositionSavedAt = nowIso;
-      this.plugin.setLocalBookProgress(file.path, cfi, nowIso);
-    } else {
-      this.plugin.settings.progress[file.path] = cfi;
-      this.plugin.requestSaveSettings();
-    }
+    const nowIso = new Date().toISOString();
+    this.lastLocalPositionSavedAt = nowIso;
+    this.plugin.setLocalBookProgress(file.path, cfi, nowIso);
 
     this.updateProgressLabels(cfi);
     this.requestYamlProgressSync();
@@ -1743,17 +1769,43 @@ export class EpubView extends FileView {
     try { this.book?.destroy(); } catch { /* ignore */ }
     this.rendition = null;
     this.book = null;
+    this.activeBookFile = null;
+  }
+
+  private finishReading(): Promise<void> {
+    if (this.closingTask) return this.closingTask;
+    // Freeze before the first await: detached/resized iframes can emit one last
+    // relocated event while Obsidian is closing a tab or changing its file.
+    this.isClosing = true;
+    this.navigationRevision++;
+    this.navigationInFlight = false;
+    this.ExplicitCfiJumpPending = false;
+    this.isResizing = false;
+    if (this.resizeTimer !== null) window.clearTimeout(this.resizeTimer);
+    this.resizeTimer = null;
+    const file = this.activeBookFile ?? this.file;
+    const cfi = toNavigationCfi(this.stableCfi);
+    if (file && cfi && (this.isInitialLoadDone || this.userHasNavigated) &&
+        !this.progressPersistenceBlocked) {
+      const savedAt = this.lastLocalPositionSavedAt ||
+        this.plugin.settings.progressUpdatedAt?.[file.path] || new Date().toISOString();
+      this.lastLocalPositionSavedAt = savedAt;
+      this.plugin.setLocalBookProgress(file.path, cfi, savedAt);
+      this.pendingYamlSync = true;
+    }
+    this.closingTask = (async () => {
+      await this.flushYamlProgress();
+      this.cleanupView();
+      await this.plugin.flushSaveSettings();
+    })();
+    return this.closingTask;
   }
 
   async onUnloadFile() {
-    await this.flushYamlProgress();
-    this.cleanupView();
-    await this.plugin.flushSaveSettings();
+    await this.finishReading();
   }
 
   async onClose() {
-    await this.flushYamlProgress();
-    this.cleanupView();
-    await this.plugin.flushSaveSettings();
+    await this.finishReading();
   }
 }

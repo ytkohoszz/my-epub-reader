@@ -116,6 +116,8 @@ export function attachInternalLinkInterceptor(view: EpubView, doc: Document) {
         return;
       }
 
+      view.userHasNavigated = true;
+      view.progressPersistenceBlocked = false;
       view.pushNavHistory();
     },
     { capture: true }

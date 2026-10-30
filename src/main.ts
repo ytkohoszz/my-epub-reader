@@ -469,9 +469,8 @@ export default class MyEpubPlugin extends Plugin {
       window.clearTimeout(this.saveTimer);
       this.saveTimer = null;
     }
-    if (this.dirty) {
-      this.dirty = false;
-      void this.saveData(this.settings);
-    }
+    void this.flushAllViewsAndSettings().catch((error: unknown) => {
+      console.error("MyEpubPlugin final save:", error);
+    });
   }
 }

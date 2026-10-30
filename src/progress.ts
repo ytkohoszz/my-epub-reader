@@ -251,7 +251,7 @@ export async function tryLoadCachedLocations(
   if (!view.book) return false;
   const sig = `${file.stat.mtime}:${file.stat.size}`;
   const cachedJson = await view.plugin.loadLocationsCacheFile(file.path, sig);
-  if (currentLoadId !== view.loadId || !view.book || !cachedJson) return false;
+  if (currentLoadId !== view.loadId || !view.book || !cachedJson || view.isClosing) return false;
 
   try {
     const parsed: unknown = JSON.parse(cachedJson);
@@ -273,7 +273,7 @@ export async function generateLocationsInBackground(
   const sig = `${file.stat.mtime}:${file.stat.size}`;
   try {
     await view.book.locations.generate(1024);
-    if (currentLoadId !== view.loadId || !view.book || !view.rendition) return;
+    if (currentLoadId !== view.loadId || !view.book || !view.rendition || view.isClosing) return;
 
     view.isGeneratingLocations = false;
     try {
@@ -285,28 +285,24 @@ export async function generateLocationsInBackground(
       // Игнорируем
     }
 
-    if (currentLoadId !== view.loadId || !view.book || !view.rendition) return;
+    if (currentLoadId !== view.loadId || !view.book || !view.rendition || view.isClosing) return;
 
     const rendExt = view.rendition as unknown as EpubRenditionExtended;
     const cur = rendExt.currentLocation?.();
     if (!view.navigationInFlight && cur?.start?.cfi) {
       captureChapterMetricsFromLoc(view, cur);
-      view.stableCfi = cur.start.cfi;
-      view.updateProgressLabels(cur.start.cfi);
+      if (!view.stableCfi || view.userHasNavigated) view.stableCfi = cur.start.cfi;
+      view.updateProgressLabels(view.stableCfi);
     }
 
     await reconcilePositionWithBookNote(view, file, currentLoadId);
     if (currentLoadId !== view.loadId) return;
 
-    view.isInitialLoadDone = true;
-    if (!view.navigationInFlight) view.ExplicitCfiJumpPending = false;
-    view.requestYamlProgressSync();
+    view.finishInitialPositionRestore();
   } catch {
-    if (currentLoadId === view.loadId) {
+    if (currentLoadId === view.loadId && !view.isClosing) {
       view.isGeneratingLocations = false;
-      view.isInitialLoadDone = true;
-      if (!view.navigationInFlight) view.ExplicitCfiJumpPending = false;
-      view.requestYamlProgressSync();
+      view.finishInitialPositionRestore();
       new Notice("Не удалось построить номера страниц. Позиция чтения продолжит сохраняться; переоткрой книгу для повторной попытки.");
     }
   }
@@ -317,7 +313,7 @@ export async function reconcilePositionWithBookNote(
   file: TFile,
   currentLoadId: number
 ) {
-  if (view.ExplicitCfiJumpPending || view.userHasNavigated || view.progressPersistenceBlocked) return;
+  if (view.ExplicitCfiJumpPending || view.userHasNavigated || view.progressPersistenceBlocked || view.isClosing) return;
   if (!view.linkedBookNote || !view.book || !view.rendition) return;
   if (!view.totalPagesNum || view.totalPagesNum <= 0) return;
 
@@ -406,8 +402,9 @@ export async function flushBookYamlProgress(view: EpubView) {
   const addedReadingMinutes = Math.floor(view.unsavedReadingSeconds / 60);
 
   if (!view.pendingYamlSync && addedReadingMinutes <= 0) return;
-  if (!view.linkedBookNote || !view.file) return;
-  if (view.linkedBookNote.linkedEpubPath !== view.file.path) return;
+  const file = view.activeBookFile ?? view.file;
+  if (!view.linkedBookNote || !file) return;
+  if (view.linkedBookNote.linkedEpubPath !== file.path) return;
 
   const noteFile = view.linkedBookNote.file;
   const pageNum = view.currentPageNum;
@@ -416,7 +413,7 @@ export async function flushBookYamlProgress(view: EpubView) {
   const cfiToSync = view.stableCfi;
   const posTimeIso =
     view.lastLocalPositionSavedAt ||
-    view.plugin.settings.progressUpdatedAt?.[view.file.path] ||
+    view.plugin.settings.progressUpdatedAt?.[file.path] ||
     new Date().toISOString();
 
   if (!cfiToSync) return;
