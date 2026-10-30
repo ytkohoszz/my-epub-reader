@@ -1,7 +1,6 @@
 import {
   cleanSelectedQuote,
   cleanSelectedWord,
-  extractSentenceFromSelection,
 } from "./modals";
 import {
   EpubContentsExtended,
@@ -77,11 +76,7 @@ export function saveCapturedText(
   view.capturedWord = cleanedWord;
   view.capturedQuote = cleanedQuote;
   view.lastSelectionAt = Date.now();
-
-  const sentence = extractSentenceFromSelection(selObj, cleanedWord);
-  if (sentence) {
-    view.extractedSentence = sentence;
-  }
+  view.capturedCfi = view.stableCfi;
 
   if (cfiOverride) {
     view.capturedCfi = cfiOverride;
@@ -98,8 +93,6 @@ export function saveCapturedText(
     } catch {
       view.capturedCfi = view.stableCfi;
     }
-  } else if (!view.capturedCfi) {
-    view.capturedCfi = view.stableCfi;
   }
 
   view.updateSelectionButtonsState();

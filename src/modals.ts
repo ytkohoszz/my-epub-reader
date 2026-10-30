@@ -1,6 +1,8 @@
 import { App, DataAdapter, Modal, Notice, TFile, requestUrl } from "obsidian";
 import { NavItem } from "epubjs";
 import type MyEpubPlugin from "./main";
+import { globalObsidianApp, isRecord } from "./navigation";
+import { getErrorMessage } from "./settings";
 
 export const EXAMPLE_SEP = " — ";
 const TRANSLATE_PER_POS = 4;
@@ -113,98 +115,9 @@ export function cleanSelectedQuote(raw: string): string {
   return String(raw ?? "").replace(/\s+/g, " ").trim();
 }
 
-// B3: Защита сокращений (Mr., Dr., U.S., e.g. и инициалов) от ложного разрыва предложения
-const ABBREV_END_REGEX =
-  /(?:^|\s)(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|Mt|vs|etc|fig|vol|ch|pp|no|e\.g|i\.e|U\.S|U\.K|Ph\.D|[A-Z])\.$/i;
-
-function mergeAbbreviationSplits(rawSegments: string[]): string[] {
-  const merged: string[] = [];
-  for (const seg of rawSegments) {
-    const trimmed = seg.trim();
-    if (!trimmed) continue;
-    const prev = merged[merged.length - 1];
-    if (prev && ABBREV_END_REGEX.test(prev)) {
-      merged[merged.length - 1] = `${prev} ${trimmed}`;
-    } else {
-      merged.push(trimmed);
-    }
-  }
-  return merged;
-}
-
-function splitParagraphIntoSentences(paragraph: string): string[] {
-  try {
-    const IntlAny = typeof Intl !== "undefined" ? (Intl as any) : null;
-    if (IntlAny && typeof IntlAny.Segmenter === "function") {
-      const segmenter = new IntlAny.Segmenter("en", { granularity: "sentence" });
-      const rawList = Array.from(segmenter.segment(paragraph), (item: any) =>
-        String(item?.segment ?? "").trim()
-      ).filter(Boolean);
-      if (rawList.length > 0) {
-        return mergeAbbreviationSplits(rawList);
-      }
-    }
-  } catch {
-    // Переходим к запасному варианту
-  }
-
-  // Запасной вариант с маскировкой точек внутри сокращений (Mr., Dr., U.S. и т.д.)
-  const DOT_PLACEHOLDER = "\uE000";
-  const masked = paragraph
-    .replace(
-      /\b(Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|Mt|vs|etc|fig|vol|ch|pp|no)\./gi,
-      `$1${DOT_PLACEHOLDER}`
-    )
-    .replace(/\b(e\.g|i\.e|U\.S|U\.K|Ph\.D)\./gi, (m) => m.replace(/\./g, DOT_PLACEHOLDER))
-    .replace(/\b([A-Z])\.(?=\s+[A-Z])/g, `$1${DOT_PLACEHOLDER}`);
-
-  const matches = masked.match(/[^.!?]+[.!?]+["”»'’)]*|[^.!?]+$/g) || [masked];
-  return matches
-    .map((s) => s.replace(/\uE000/g, ".").trim())
-    .filter(Boolean);
-}
-
-// B3: Умное извлечение полного предложения из абзаца книги вокруг выделенного слова
-export function extractSentenceFromSelection(sel: Selection | null | undefined, word: string): string {
-  if (!sel || sel.rangeCount === 0) return "";
-  try {
-    const range = sel.getRangeAt(0);
-    let node: Node | null = range.startContainer;
-    let blockEl: HTMLElement | null = null;
-
-    while (node && node.nodeName !== "BODY" && node.nodeName !== "HTML") {
-      if (node.nodeType === 1) {
-        const tag = (node as HTMLElement).tagName.toUpperCase();
-        if (/^(P|LI|BLOCKQUOTE|DD|DT|H1|H2|H3|H4|H5|H6|DIV|TD)$/.test(tag)) {
-          blockEl = node as HTMLElement;
-          break;
-        }
-      }
-      node = node.parentNode;
-    }
-
-    const rawText = (blockEl ? blockEl.textContent : range.startContainer.textContent) || "";
-    const paragraph = rawText.replace(/\s+/g, " ").trim();
-    if (!paragraph) return "";
-
-    const sentences = splitParagraphIntoSentences(paragraph);
-    const cleanW = word.trim().toLowerCase();
-
-    for (const s of sentences) {
-      const trimmed = s.trim();
-      if (cleanW && trimmed.toLowerCase().includes(cleanW)) {
-        return cleanExample(trimmed);
-      }
-    }
-    return cleanExample(sentences[0]?.trim() || "");
-  } catch {
-    return "";
-  }
-}
-
 export function extractLinkTarget(raw: unknown): string | null {
   if (!raw) return null;
-  if (typeof raw === "object" && (raw as any).path) return String((raw as any).path).trim();
+  if (isRecord(raw) && typeof raw.path === "string") return raw.path.trim();
   const str = String(raw).trim();
   const clean = str.startsWith("[[") && str.endsWith("]]") ? str.slice(2, -2) : str;
   const barIdx = clean.indexOf("|");
@@ -342,7 +255,6 @@ export function configureTranslationCache(app: App, pluginDir?: string) {
   cacheAdapter = app.vault.adapter;
   const dir =
     pluginDir ||
-    (app as any)?.plugins?.plugins?.["my-epub-reader"]?.manifest?.dir ||
     `${app.vault.configDir}/plugins/my-epub-reader`;
   cacheFilePath = `${dir}/${TRANSLATION_CACHE_FILENAME}`;
 }
@@ -351,8 +263,7 @@ function resolveCacheAdapterAndPath(): { adapter: DataAdapter; path: string } | 
   if (cacheAdapter && cacheFilePath) {
     return { adapter: cacheAdapter, path: cacheFilePath };
   }
-  const globalApp: App | undefined =
-    typeof window !== "undefined" ? (window as any).app : undefined;
+  const globalApp = typeof window !== "undefined" ? globalObsidianApp() : undefined;
   if (globalApp?.vault?.adapter) {
     configureTranslationCache(globalApp);
     if (cacheAdapter && cacheFilePath) {
@@ -439,48 +350,54 @@ const DESKTOP_HEADERS: Record<string, string> = {
 };
 
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-  return Promise.race([
-    p,
-    new Promise<T>((_, rej) =>
-      setTimeout(() => rej(new Error(`нет ответа за ${ms / 1000} с`)), ms)
-    ),
-  ]);
+  return new Promise<T>((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(new Error(`нет ответа за ${ms / 1000} с`)), ms);
+    p.then(
+      value => { window.clearTimeout(timer); resolve(value); },
+      (error: unknown) => { window.clearTimeout(timer); reject(error); }
+    );
+  });
 }
 
-function parseGoogleData(d: any): TranslationGroup[] {
+function parseGoogleData(d: unknown): TranslationGroup[] {
   const groups: TranslationGroup[] = [];
-  if (Array.isArray(d?.[1])) {
-    d[1].forEach((e: any) => {
-      const terms = (Array.isArray(e?.[1]) ? e[1] : []).filter(
-        (t: any) => typeof t === "string" && t.trim()
-      );
+  const list: unknown[] = Array.isArray(d) ? d : [];
+  const record = isRecord(d) ? d : {};
+  const termsFrom = (value: unknown): string[] =>
+    (Array.isArray(value) ? value as unknown[] : [])
+      .filter((term): term is string => typeof term === "string" && Boolean(term.trim()))
+      .map(term => term.trim()).slice(0, TRANSLATE_PER_POS);
+  if (Array.isArray(list[1])) {
+    (list[1] as unknown[]).forEach(entry => {
+      if (!Array.isArray(entry)) return;
+      const e: unknown[] = entry;
+      const terms = termsFrom(e[1]);
       if (terms.length) {
         groups.push({
           pos: String(e[0] || "перевод"),
-          terms: terms.slice(0, TRANSLATE_PER_POS).map((t: string) => t.trim()),
+          terms,
         });
       }
     });
   }
-  if (!groups.length && Array.isArray(d?.dict)) {
-    d.dict.forEach((entry: any) => {
-      const terms = (Array.isArray(entry?.terms) ? entry.terms : []).filter(
-        (t: any) => typeof t === "string" && t.trim()
-      );
+  if (!groups.length && Array.isArray(record.dict)) {
+    (record.dict as unknown[]).forEach(entry => {
+      if (!isRecord(entry)) return;
+      const terms = termsFrom(entry.terms);
       if (terms.length) {
         groups.push({
           pos: String(entry.pos || "перевод"),
-          terms: terms.slice(0, TRANSLATE_PER_POS).map((t: string) => t.trim()),
+          terms,
         });
       }
     });
   }
-  if (!groups.length && Array.isArray(d?.sentences)) {
-    const main = d.sentences.map((s: any) => s?.trans).filter(Boolean).join("").trim();
+  if (!groups.length && Array.isArray(record.sentences)) {
+    const main = (record.sentences as unknown[]).map(s => isRecord(s) && typeof s.trans === "string" ? s.trans : "").join("").trim();
     if (main) groups.push({ pos: "перевод", terms: [main] });
   }
-  if (!groups.length && Array.isArray(d?.[0])) {
-    const main = d[0].map((s: any) => s?.[0]).filter(Boolean).join("").trim();
+  if (!groups.length && Array.isArray(list[0])) {
+    const main = (list[0] as unknown[]).map(s => Array.isArray(s) && typeof s[0] === "string" ? s[0] : "").join("").trim();
     if (main) groups.push({ pos: "перевод", terms: [main] });
   }
   return groups;
@@ -508,7 +425,7 @@ export async function fetchTranslations(word: string): Promise<TranslationGroup[
     `https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=ru&dt=t&dt=bd&q=${q}`,
   ];
 
-  let lastErr: any = null;
+  let lastErr: unknown = null;
   for (const url of endpoints) {
     try {
       const r = await withTimeout(requestUrl({ url, headers: DESKTOP_HEADERS }), TRANSLATE_TIMEOUT_MS);
@@ -531,16 +448,17 @@ export async function fetchTranslations(word: string): Promise<TranslationGroup[
       requestUrl({ url: fallbackUrl, headers: DESKTOP_HEADERS }),
       TRANSLATE_TIMEOUT_MS
     );
-    const data = typeof r.json === "object" && r.json !== null ? r.json : JSON.parse(r.text);
+    const raw: unknown = typeof r.json === "object" && r.json !== null ? r.json : JSON.parse(r.text);
+    const data = isRecord(raw) ? raw : {};
     const termsSet = new Set<string>();
 
-    const mainText = data?.responseData?.translatedText;
+    const mainText = isRecord(data.responseData) ? data.responseData.translatedText : null;
     if (typeof mainText === "string" && mainText.trim() && mainText.toLowerCase() !== cacheKey) {
       termsSet.add(mainText.trim().toLowerCase());
     }
     if (Array.isArray(data?.matches)) {
-      data.matches.forEach((m: any) => {
-        const t = String(m?.translation ?? "").trim();
+      (data.matches as unknown[]).forEach(m => {
+        const t = isRecord(m) && typeof m.translation === "string" ? m.translation.trim() : "";
         if (t && t.toLowerCase() !== cacheKey && !/[a-zA-Z]{3,}/.test(t)) {
           termsSet.add(t.toLowerCase());
         }
@@ -673,7 +591,7 @@ function isQuoteInSelectedBook(q: ExistingQuoteRecord, book: BookNoteInfo | null
 
 function safeCloseModal(modal: Modal) {
   try {
-    (modal as any).shouldRestoreSelection = false;
+    modal.shouldRestoreSelection = false;
     modal.close();
   } catch (e) {
     console.log("Safe modal close:", e);
@@ -687,13 +605,13 @@ export class TocModal extends Modal {
 
   constructor(app: App, toc: NavItem[], onSelect: (href: string) => void) {
     super(app);
-    (this as any).shouldRestoreSelection = false;
+    this.shouldRestoreSelection = false;
     this.toc = toc;
     this.onSelect = onSelect;
   }
 
   onOpen() {
-    (this as any).shouldRestoreSelection = false;
+    this.shouldRestoreSelection = false;
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("my-epub-toc-modal");
@@ -714,8 +632,8 @@ export class TocModal extends Modal {
       row.style.paddingLeft = `${0.75 + level * 1.25}rem`;
       row.setText((item.label || "Без названия").trim());
       row.onclick = () => {
-        this.onSelect(item.href);
         safeCloseModal(this);
+        this.onSelect(item.href);
       };
       if (item.subitems && item.subitems.length > 0) {
         this.renderItems(container, item.subitems, level + 1);
@@ -743,7 +661,7 @@ export class JumpToPageModal extends Modal {
     onJumpPage: (page: number) => void
   ) {
     super(app);
-    (this as any).shouldRestoreSelection = false;
+    this.shouldRestoreSelection = false;
     this.currentPage = currentPage;
     this.totalPages = totalPages;
     this.chapterInfoText = chapterInfoText;
@@ -751,7 +669,7 @@ export class JumpToPageModal extends Modal {
   }
 
   onOpen() {
-    (this as any).shouldRestoreSelection = false;
+    this.shouldRestoreSelection = false;
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("my-epub-modal");
@@ -809,16 +727,24 @@ export class JumpToPageModal extends Modal {
     };
 
     pageInput.oninput = () => {
-      const p = Math.max(1, Math.min(this.totalPages, Number(pageInput.value) || 1));
+      const p = Number(pageInput.value);
+      if (!pageInput.value.trim() || !Number.isInteger(p) || p < 1 || p > this.totalPages) return;
       const pct = Math.round((p / Math.max(1, this.totalPages)) * 100);
       rangeInput.value = String(p);
       sliderLabel.setText(`Позиция: стр. ${p} из ${this.totalPages} (${pct}%)`);
     };
 
+    let submitted = false;
     const doJump = () => {
-      const target = Math.max(1, Math.min(this.totalPages, Number(pageInput.value) || 1));
-      this.onJumpPage(target);
+      if (submitted) return;
+      const input = Number(pageInput.value);
+      if (!pageInput.value.trim() || !Number.isFinite(input) || !Number.isInteger(input) || input < 1 || input > this.totalPages) {
+        new Notice(`Введи целую страницу от 1 до ${this.totalPages}.`);
+        return;
+      }
+      submitted = true;
       safeCloseModal(this);
+      this.onJumpPage(input);
     };
 
     goBtn.onclick = doJump;
@@ -830,6 +756,7 @@ export class JumpToPageModal extends Modal {
     };
 
     window.setTimeout(() => {
+      if (!this.modalEl.isConnected) return;
       pageInput.focus();
       pageInput.select();
     }, 40);
@@ -867,7 +794,7 @@ export class BookLinkModal extends Modal {
     onResolved: (bookNote: BookNoteInfo) => void
   ) {
     super(app);
-    (this as any).shouldRestoreSelection = false;
+    this.shouldRestoreSelection = false;
     this.epubFile = epubFile;
     this.booksFolder = booksFolder;
     this.candidates = candidates;
@@ -881,7 +808,7 @@ export class BookLinkModal extends Modal {
   }
 
   onOpen() {
-    (this as any).shouldRestoreSelection = false;
+    this.shouldRestoreSelection = false;
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("my-epub-modal");
@@ -1072,8 +999,8 @@ export class BookLinkModal extends Modal {
           linkedEpubPath: this.epubFile.path,
         };
         new Notice(`Создана и привязана книга «${title}»`);
-      } catch (e: any) {
-        new Notice("Ошибка: " + (e?.message || e));
+      } catch (e: unknown) {
+        new Notice("Ошибка: " + getErrorMessage(e));
         createBtn.disabled = false;
         return;
       }
@@ -1108,8 +1035,8 @@ export class BookLinkModal extends Modal {
       chosen.bookPropRaw = wikiLink;
       chosen.linkedEpubPath = this.epubFile.path;
       new Notice(`Книга привязана к заметке «${chosen.title}»`);
-    } catch (e: any) {
-      new Notice("Ошибка записи YAML: " + (e?.message || e));
+    } catch (e: unknown) {
+      new Notice("Ошибка записи YAML: " + getErrorMessage(e));
       return;
     }
     this.onResolved(chosen);
@@ -1126,7 +1053,6 @@ export class AddWordModal extends Modal {
   plugin: MyEpubPlugin;
   initialWord: string;
   capturedCfi: string | null;
-  extractedContextSentence: string;
   preselectedBook: BookNoteInfo | null;
   allBooks: BookNoteInfo[];
   selectedVariants: string[] = [];
@@ -1138,23 +1064,21 @@ export class AddWordModal extends Modal {
     plugin: MyEpubPlugin,
     initialWord: string,
     capturedCfi: string | null,
-    extractedContextSentence: string,
     preselectedBook: BookNoteInfo | null,
     allBooks: BookNoteInfo[]
   ) {
     super(app);
-    (this as any).shouldRestoreSelection = false;
+    this.shouldRestoreSelection = false;
     this.plugin = plugin;
     this.initialWord = initialWord;
     this.capturedCfi = capturedCfi;
-    this.extractedContextSentence = extractedContextSentence;
     this.preselectedBook = preselectedBook;
     this.allBooks = allBooks;
     configureTranslationCache(app, plugin.manifest?.dir);
   }
 
   async onOpen() {
-    (this as any).shouldRestoreSelection = false;
+    this.shouldRestoreSelection = false;
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("my-epub-modal");
@@ -1203,30 +1127,6 @@ export class AddWordModal extends Modal {
     variantsBox.style.display = "none";
 
     const secondRow = contentEl.createDiv("my-epub-modal-row");
-    const exInput = secondRow.createEl("input", {
-      cls: "my-epub-input-ex",
-      type: "text",
-      placeholder: "Пример предложения (необязательно)",
-      value: "",
-    });
-
-    if (this.extractedContextSentence) {
-      const fromBookBtn = secondRow.createEl("button", {
-        cls: "my-epub-modal-btn",
-        text: "📖 Из книги",
-        attr: { title: `Вставить из книги: «${this.extractedContextSentence}»` },
-      });
-      fromBookBtn.onclick = () => {
-        if (exInput.value.trim() === this.extractedContextSentence) {
-          exInput.value = "";
-          fromBookBtn.setText("📖 Из книги");
-        } else {
-          exInput.value = this.extractedContextSentence;
-          fromBookBtn.setText("✕ Убрать пример");
-        }
-      };
-    }
-
     const sourceSelect = secondRow.createEl("select", {
       cls: "dropdown my-epub-source-select",
     });
@@ -1329,6 +1229,7 @@ export class AddWordModal extends Modal {
       trBtn.setText("⏳...");
       try {
         const groups = await fetchTranslations(en);
+        if (!this.modalEl.isConnected || enInput.value.trim() !== en) return;
         if (!groups.length) {
           new Notice("Переводов не найдено — впиши вручную.");
           this.translatedGroups = [];
@@ -1344,8 +1245,8 @@ export class AddWordModal extends Modal {
           applySelectedVariants();
         }
         renderVariants(groups);
-      } catch (e: any) {
-        new Notice("Не удалось получить перевод: " + (e?.message || e) + ". Впиши вручную.");
+      } catch (e: unknown) {
+        new Notice("Не удалось получить перевод: " + getErrorMessage(e) + ". Впиши вручную.");
       } finally {
         trBtn.disabled = false;
         trBtn.setText("🌐 Перевести");
@@ -1366,7 +1267,6 @@ export class AddWordModal extends Modal {
       if (addBtn.disabled) return;
       const en = enInput.value.trim().replace(/\s+/g, " ");
       const ru = ruInput.value.trim().replace(/\s+/g, " ");
-      const ex = cleanExample(exInput.value);
       const chosenBook = this.allBooks.find((b) => b.path === sourceSelect.value) || null;
 
       if (!en || !ru) {
@@ -1413,7 +1313,7 @@ export class AddWordModal extends Modal {
           }
         }
 
-        const front = ex ? `${en}${EXAMPLE_SEP}${ex}` : en;
+        const front = en;
         let backWithSource = ru;
         if (chosenBook) {
           const cleanCfi =
@@ -1424,13 +1324,37 @@ export class AddWordModal extends Modal {
           backWithSource = `${ru} · ${wiki}`;
         }
 
-        const prefix = freshContent.length > 0 && !freshContent.endsWith("\n") ? "\n" : "";
-        await this.app.vault.append(targetWordsFile, `${prefix}${front} ::: ${backWithSource}\n`);
+        // Recheck in the atomic operation: another window/plugin may have
+        // modified the dictionary after the initial read.
+        let appended = false;
+        let latestSame: ExistingWordCard[] = [];
+        await this.app.vault.process(targetWordsFile, content => {
+          latestSame = parseExistingWordsForDuplicates(content).filter(card => card.key === k);
+          const duplicate = latestSame.some(card => normText(card.back) === normText(ru));
+          const needsConfirmation = latestSame.length > 0 && pendingKey !== `${k}|${normText(ru)}`;
+          if (duplicate || needsConfirmation) return content;
+          const prefix = content.length > 0 && !content.endsWith("\n") ? "\n" : "";
+          appended = true;
+          return `${content}${prefix}${front} ::: ${backWithSource}\n`;
+        });
+        if (!appended) {
+          showDup(latestSame);
+          const duplicate = latestSame.some(card => normText(card.back) === normText(ru));
+          if (duplicate) {
+            new Notice("Такая карточка с этим переводом уже есть — дубликат не добавлен.");
+          } else {
+            pendingKey = `${k}|${normText(ru)}`;
+            addBtn.setText("Всё равно добавить");
+            new Notice("Словарь изменился. Нажми ещё раз, чтобы добавить другой перевод.");
+          }
+          addBtn.disabled = false;
+          return;
+        }
 
         savedSuccessfully = true;
         noticeText = `✓ Добавлено: ${front} ::: ${ru}${chosenBook ? " (" + chosenBook.title + ")" : ""}`;
-      } catch (e: any) {
-        new Notice("Ошибка добавления: " + (e?.message || e));
+      } catch (e: unknown) {
+        new Notice("Ошибка добавления: " + getErrorMessage(e));
         addBtn.disabled = false;
         return;
       }
@@ -1450,12 +1374,6 @@ export class AddWordModal extends Modal {
       }
     };
     ruInput.onkeydown = (e) => {
-      if (e.key === "Enter") {
-        e.preventDefault();
-        void submitWord();
-      }
-    };
-    exInput.onkeydown = (e) => {
       if (e.key === "Enter") {
         e.preventDefault();
         void submitWord();
@@ -1505,7 +1423,7 @@ export class AddQuoteModal extends Modal {
     allBooks: BookNoteInfo[]
   ) {
     super(app);
-    (this as any).shouldRestoreSelection = false;
+    this.shouldRestoreSelection = false;
     this.plugin = plugin;
     this.initialQuote = initialQuote;
     this.capturedCfi = capturedCfi;
@@ -1514,7 +1432,7 @@ export class AddQuoteModal extends Modal {
   }
 
   async onOpen() {
-    (this as any).shouldRestoreSelection = false;
+    this.shouldRestoreSelection = false;
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("my-epub-modal");
@@ -1670,8 +1588,8 @@ export class AddQuoteModal extends Modal {
         const entryLine = `\n- (категория:: Книга) (книга_ссылка:: ${cleanLink}) (книга:: ${cleanTitle}) (дата:: ${todayISO})${posPart} (цитата:: ${cleanText})`;
         await this.app.vault.append(qFile, entryLine);
         savedOk = true;
-      } catch (e: any) {
-        new Notice("Ошибка сохранения цитаты: " + (e?.message || e));
+      } catch (e: unknown) {
+        new Notice("Ошибка сохранения цитаты: " + getErrorMessage(e));
         saveBtn.disabled = false;
         return;
       }

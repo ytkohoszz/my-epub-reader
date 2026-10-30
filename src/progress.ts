@@ -1,4 +1,5 @@
-import { TFile } from "obsidian";
+import { Notice, TFile } from "obsidian";
+import { toNavigationCfi } from "./navigation";
 import { NavItem } from "epubjs";
 import { getTodayISO } from "./modals";
 import {
@@ -160,7 +161,9 @@ export function buildChapterSummaryText(view: EpubView): string {
 }
 
 export function getCfiFromPageNumberSafe(view: EpubView, page: number): string | null {
-  if (!view.book || !view.totalPagesNum || view.totalPagesNum <= 0) return null;
+  if (!view.book || !Number.isInteger(page) || !Number.isInteger(view.totalPagesNum) ||
+      !view.totalPagesNum || view.totalPagesNum <= 0) return null;
+  if (page < 1 || page > view.totalPagesNum) return null;
   const total = view.totalPagesNum;
   const clampedPage = Math.max(1, Math.min(total, Math.round(page)));
   const idx = clampedPage - 1;
@@ -169,18 +172,22 @@ export function getCfiFromPageNumberSafe(view: EpubView, page: number): string |
   if (typeof locs.cfiFromLocation === "function") {
     try {
       const cfi = locs.cfiFromLocation(idx);
-      if (typeof cfi === "string" && cfi.length > 0) return cfi;
+      const target = toNavigationCfi(cfi);
+      if (target) return target;
     } catch {
       // Игнорируем
     }
   }
 
   const fromArr = locs._locations?.[idx];
-  if (typeof fromArr === "string" && fromArr.length > 0) return fromArr;
+  const fromArray = toNavigationCfi(fromArr);
+  if (fromArray) return fromArray;
 
-  return view.book.locations.cfiFromPercentage(
-    Math.max(0, Math.min(1, idx / Math.max(1, total)))
-  );
+  try {
+    return toNavigationCfi(view.book.locations.cfiFromPercentage(
+      Math.max(0, Math.min(1, idx / Math.max(1, total - 1)))
+    ));
+  } catch { return null; }
 }
 
 export function getCfiFromPageNumber(view: EpubView, page: number): string | null {
@@ -191,7 +198,7 @@ export function resolveInitialCfiBeforeRender(
   view: EpubView,
   file: TFile
 ): { cfi: string | null; savedAt: string | null } {
-  const localCfi = view.plugin.settings.progress[file.path] || null;
+  const localCfi = toNavigationCfi(view.plugin.settings.progress[file.path]);
   const localTimeStr = view.plugin.settings.progressUpdatedAt?.[file.path] || null;
 
   if (view.ExplicitCfiJumpPending || !view.linkedBookNote) {
@@ -202,7 +209,7 @@ export function resolveInitialCfiBeforeRender(
   if (!fm) return { cfi: localCfi, savedAt: localTimeStr };
 
   const rawYamlCfi = typeof fm["позиция"] === "string" ? fm["позиция"].trim() : "";
-  const yamlCfi = rawYamlCfi.startsWith("epubcfi(") ? rawYamlCfi : null;
+  const yamlCfi = toNavigationCfi(rawYamlCfi);
   const yamlTimeStr =
     typeof fm["позиция_время"] === "string" && fm["позиция_время"].trim()
       ? fm["позиция_время"].trim()
@@ -223,14 +230,16 @@ export function resolveInitialCfiBeforeRender(
   const yamlMs = yamlTimeStr ? Date.parse(yamlTimeStr) : NaN;
   const localMs = localTimeStr ? Date.parse(localTimeStr) : NaN;
 
-  if (Number.isFinite(yamlMs) && Number.isFinite(localMs)) {
+  if (localCfi && Number.isFinite(yamlMs) && Number.isFinite(localMs)) {
     if (yamlMs > localMs) {
-      view.plugin.setLocalBookProgress(file.path, yamlCfi, yamlTimeStr!);
       return { cfi: yamlCfi, savedAt: yamlTimeStr };
     }
     return { cfi: localCfi, savedAt: localTimeStr };
   }
 
+  if (localCfi && Number.isFinite(localMs) && !Number.isFinite(yamlMs)) {
+    return { cfi: localCfi, savedAt: localTimeStr };
+  }
   return { cfi: yamlCfi, savedAt: yamlTimeStr || localTimeStr };
 }
 
@@ -245,6 +254,9 @@ export async function tryLoadCachedLocations(
   if (currentLoadId !== view.loadId || !view.book || !cachedJson) return false;
 
   try {
+    const parsed: unknown = JSON.parse(cachedJson);
+    if (!Array.isArray(parsed) || !parsed.length ||
+        !(parsed as unknown[]).every(cfi => toNavigationCfi(cfi) !== null)) return false;
     view.book.locations.load(cachedJson);
     return view.book.locations.length() > 0;
   } catch {
@@ -277,7 +289,7 @@ export async function generateLocationsInBackground(
 
     const rendExt = view.rendition as unknown as EpubRenditionExtended;
     const cur = rendExt.currentLocation?.();
-    if (cur?.start?.cfi) {
+    if (!view.navigationInFlight && cur?.start?.cfi) {
       captureChapterMetricsFromLoc(view, cur);
       view.stableCfi = cur.start.cfi;
       view.updateProgressLabels(cur.start.cfi);
@@ -287,11 +299,15 @@ export async function generateLocationsInBackground(
     if (currentLoadId !== view.loadId) return;
 
     view.isInitialLoadDone = true;
-    view.ExplicitCfiJumpPending = false;
+    if (!view.navigationInFlight) view.ExplicitCfiJumpPending = false;
     view.requestYamlProgressSync();
   } catch {
     if (currentLoadId === view.loadId) {
       view.isGeneratingLocations = false;
+      view.isInitialLoadDone = true;
+      if (!view.navigationInFlight) view.ExplicitCfiJumpPending = false;
+      view.requestYamlProgressSync();
+      new Notice("Не удалось построить номера страниц. Позиция чтения продолжит сохраняться; переоткрой книгу для повторной попытки.");
     }
   }
 }
@@ -301,7 +317,7 @@ export async function reconcilePositionWithBookNote(
   file: TFile,
   currentLoadId: number
 ) {
-  if (view.ExplicitCfiJumpPending) return;
+  if (view.ExplicitCfiJumpPending || view.userHasNavigated || view.progressPersistenceBlocked) return;
   if (!view.linkedBookNote || !view.book || !view.rendition) return;
   if (!view.totalPagesNum || view.totalPagesNum <= 0) return;
 
@@ -309,7 +325,7 @@ export async function reconcilePositionWithBookNote(
   if (!fm) return;
 
   const rawYamlCfi = typeof fm["позиция"] === "string" ? fm["позиция"].trim() : "";
-  const yamlCfi = rawYamlCfi.startsWith("epubcfi(") ? rawYamlCfi : null;
+  const yamlCfi = toNavigationCfi(rawYamlCfi);
   const yamlTimeStr =
     typeof fm["позиция_время"] === "string" && fm["позиция_время"].trim()
       ? fm["позиция_время"].trim()
@@ -320,8 +336,8 @@ export async function reconcilePositionWithBookNote(
     rawYamlRead !== undefined && rawYamlRead !== null && String(rawYamlRead).trim() !== "";
   const parsedYamlPage = hasYamlRead ? Math.round(Number(rawYamlRead)) : NaN;
   const yamlPage =
-    Number.isFinite(parsedYamlPage) && parsedYamlPage > 0
-      ? Math.max(1, Math.min(view.totalPagesNum, parsedYamlPage))
+    Number.isFinite(parsedYamlPage) && parsedYamlPage > 0 && parsedYamlPage <= view.totalPagesNum
+      ? parsedYamlPage
       : null;
 
   const localTimeStr =
@@ -332,85 +348,50 @@ export async function reconcilePositionWithBookNote(
   const localMs = localTimeStr ? Date.parse(localTimeStr) : NaN;
   const hasBothTimes = Number.isFinite(yamlMs) && Number.isFinite(localMs);
 
-  const localPage = view.currentPageNum ?? 1;
-
   const pickTargetCfiFromYaml = (): string | null => {
-    if (yamlCfi) {
-      if (yamlPage !== null) {
-        const cfiIdx = Number(view.book!.locations.locationFromCfi(yamlCfi));
-        const cfiPage = Math.max(1, Math.min(view.totalPagesNum!, cfiIdx + 1));
-        if (Math.abs(cfiPage - yamlPage) >= 1) {
-          return getCfiFromPageNumberSafe(view, yamlPage);
-        }
-      }
-      return yamlCfi;
-    }
+    // The CFI anchor takes priority over potentially renumbered page labels.
+    if (yamlCfi) return yamlCfi;
     if (yamlPage !== null) {
       return getCfiFromPageNumberSafe(view, yamlPage);
     }
     return null;
   };
 
+  const restore = async (target: string, savedAt: string) => {
+    const rendition = view.rendition;
+    if (!rendition || currentLoadId !== view.loadId || view.userHasNavigated) return;
+    try {
+      await rendition.display(target);
+      if (currentLoadId !== view.loadId || rendition !== view.rendition || view.userHasNavigated) return;
+      view.stableCfi = target;
+      view.lastLocalPositionSavedAt = savedAt;
+      view.plugin.setLocalBookProgress(file.path, target, savedAt);
+      view.updateProgressLabels(target);
+    } catch {
+      new Notice("Не удалось восстановить позицию из заметки. Текущий прогресс сохранён.");
+    }
+  };
+
   if (hasBothTimes) {
-    if (localMs > yamlMs) return;
+    if (localMs >= yamlMs) return;
     if (yamlMs > localMs) {
       const targetCfi = pickTargetCfiFromYaml();
       if (targetCfi && targetCfi !== view.stableCfi && currentLoadId === view.loadId) {
-        view.stableCfi = targetCfi;
-        view.lastLocalPositionSavedAt = yamlTimeStr;
-        view.plugin.setLocalBookProgress(file.path, targetCfi, yamlTimeStr!);
-        try {
-          await view.rendition.display(targetCfi);
-        } catch {
-          // Игнорируем
-        }
-        view.updateProgressLabels(targetCfi);
+        await restore(targetCfi, yamlTimeStr!);
       }
       return;
-    }
-    if (yamlPage !== null && yamlPage !== localPage) {
-      const targetCfi = getCfiFromPageNumberSafe(view, yamlPage);
-      if (targetCfi && currentLoadId === view.loadId) {
-        const nowIso = new Date().toISOString();
-        view.stableCfi = targetCfi;
-        view.lastLocalPositionSavedAt = nowIso;
-        view.plugin.setLocalBookProgress(file.path, targetCfi, nowIso);
-        try {
-          await view.rendition.display(targetCfi);
-        } catch {
-          // Игнорируем
-        }
-        view.updateProgressLabels(targetCfi);
-      }
     }
     return;
   }
 
-  if (yamlPage !== null && yamlPage !== localPage) {
+  // With no comparable timestamps, never replace a valid CFI with a page label.
+  if (toNavigationCfi(view.stableCfi)) return;
+  if (yamlPage !== null || yamlCfi) {
     const targetCfi = pickTargetCfiFromYaml();
     if (targetCfi && currentLoadId === view.loadId) {
       const syncedTime = yamlTimeStr || new Date().toISOString();
-      view.stableCfi = targetCfi;
-      view.lastLocalPositionSavedAt = syncedTime;
-      view.plugin.setLocalBookProgress(file.path, targetCfi, syncedTime);
-      try {
-        await view.rendition.display(targetCfi);
-      } catch {
-        // Игнорируем
-      }
-      view.updateProgressLabels(targetCfi);
+      await restore(targetCfi, syncedTime);
     }
-  } else if (yamlCfi && yamlCfi !== view.stableCfi && !view.stableCfi) {
-    const syncedTime = yamlTimeStr || new Date().toISOString();
-    view.stableCfi = yamlCfi;
-    view.lastLocalPositionSavedAt = syncedTime;
-    view.plugin.setLocalBookProgress(file.path, yamlCfi, syncedTime);
-    try {
-      await view.rendition.display(yamlCfi);
-    } catch {
-      // Игнорируем
-    }
-    view.updateProgressLabels(yamlCfi);
   }
 }
 
@@ -419,7 +400,7 @@ export async function flushBookYamlProgress(view: EpubView) {
     window.clearTimeout(view.yamlSyncTimer);
     view.yamlSyncTimer = null;
   }
-  if (view.navHistory.length > 0) return;
+  if (view.ExplicitCfiJumpPending || view.isResizing || view.progressPersistenceBlocked) return;
 
   accrueActiveReadingTime(view, Date.now());
   const addedReadingMinutes = Math.floor(view.unsavedReadingSeconds / 60);
@@ -496,6 +477,7 @@ export async function flushBookYamlProgress(view: EpubView) {
     if (addedReadingMinutes > 0) {
       view.unsavedReadingSeconds += addedReadingMinutes * 60;
     }
+    view.pendingYamlSync = true;
     console.error("MyEpubPlugin error syncing YAML frontmatter:", e);
   }
 }

@@ -1,4 +1,7 @@
-import { App, Modal, Notice, TFile } from "obsidian";
+import { App, MarkdownView, Modal, Notice, TFile } from "obsidian";
+import Section from "epubjs/types/section";
+import { globalObsidianApp, isRecord } from "./navigation";
+import { EpubRenditionExtended, getErrorMessage } from "./settings";
 import { Book, NavItem, Rendition } from "epubjs";
 import {
   BookNoteInfo,
@@ -86,7 +89,7 @@ function resolveVaultFile(app: App, rawPath: string): TFile | null {
 }
 
 async function openVaultFileAtLine(app: App | null, rawPath: string, lineNumberOneBased: number) {
-  const targetApp = app ?? (typeof window !== "undefined" ? (window as any).app : null);
+  const targetApp = app ?? (typeof window !== "undefined" ? globalObsidianApp() : null);
   if (!targetApp) return;
 
   const file = resolveVaultFile(targetApp, rawPath);
@@ -101,8 +104,8 @@ async function openVaultFileAtLine(app: App | null, rawPath: string, lineNumberO
   const lineIdx = Math.max(0, (lineNumberOneBased || 1) - 1);
   window.setTimeout(() => {
     try {
-      const view: any = targetApp.workspace.activeLeaf?.view;
-      const editor = view?.editor;
+      const view = leaf.view;
+      const editor = view instanceof MarkdownView ? view.editor : null;
       if (editor) {
         editor.setCursor({ line: lineIdx, ch: 0 });
         editor.scrollIntoView(
@@ -347,7 +350,7 @@ function showHighlightPopoverCard(
     });
 
     try {
-      const contentsList: any[] = (rendition as any)?.getContents?.() || [];
+      const contentsList = (rendition as unknown as EpubRenditionExtended).getContents?.() || [];
       for (const c of contentsList) {
         const doc: Document | undefined = c?.document;
         if (doc) {
@@ -414,7 +417,6 @@ export function applyHighlightsToRendition(
         w.cfi,
         {},
         () => {
-          speakEnglishText(w.word);
           showHighlightPopoverCard(rendition, {
             type: "word",
             title: w.word,
@@ -467,7 +469,7 @@ export class QuickTranslateModal extends Modal {
 
   constructor(app: App, textToTranslate: string, onSaveToVocab: (word: string) => void) {
     super(app);
-    (this as any).shouldRestoreSelection = false;
+    this.shouldRestoreSelection = false;
     this.textToTranslate = textToTranslate;
     this.onSaveToVocab = onSaveToVocab;
     configureTranslationCache(app);
@@ -475,7 +477,7 @@ export class QuickTranslateModal extends Modal {
 
   safeClose() {
     try {
-      (this as any).shouldRestoreSelection = false;
+      this.shouldRestoreSelection = false;
       this.close();
     } catch {
       // Игнорируем
@@ -483,7 +485,7 @@ export class QuickTranslateModal extends Modal {
   }
 
   async onOpen() {
-    (this as any).shouldRestoreSelection = false;
+    this.shouldRestoreSelection = false;
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("my-epub-modal");
@@ -498,13 +500,6 @@ export class QuickTranslateModal extends Modal {
       value: this.textToTranslate,
       placeholder: "Слово или фраза на английском…",
     });
-
-    const speakBtn = topRow.createEl("button", {
-      cls: "my-epub-modal-btn",
-      text: "🔊",
-      attr: { title: "Озвучить", "aria-label": "Озвучить слово" },
-    });
-    speakBtn.onclick = () => speakEnglishText(input.value);
 
     const trBtn = topRow.createEl("button", {
       cls: "my-epub-modal-btn",
@@ -555,10 +550,10 @@ export class QuickTranslateModal extends Modal {
             text: g.terms.join(" · "),
           });
         }
-      } catch (e: any) {
+      } catch (e: unknown) {
         if (closed || mySeq !== requestSeq) return;
         resultBox.empty();
-        resultBox.setText("Ошибка перевода: " + (e?.message || e));
+        resultBox.setText("Ошибка перевода: " + getErrorMessage(e));
       }
     };
 
@@ -570,7 +565,6 @@ export class QuickTranslateModal extends Modal {
       }
     };
 
-    speakEnglishText(this.textToTranslate);
     await runLookup();
   }
 
@@ -581,7 +575,7 @@ export class QuickTranslateModal extends Modal {
 
 // Вспомогательный ручной поиск по DOM секции, если item.find в epub.js недоступен
 function manualSearchInSectionDom(
-  sectionItem: any,
+  sectionItem: Section,
   query: string,
   maxNeeded: number
 ): Array<{ cfi: string; excerpt: string }> {
@@ -675,7 +669,7 @@ export class BookNavModal extends Modal {
     }
   ) {
     super(app);
-    (this as any).shouldRestoreSelection = false;
+    this.shouldRestoreSelection = false;
     this.book = opts.book ?? null;
     this.toc = opts.toc;
     this.bookmarks = opts.bookmarks;
@@ -694,7 +688,7 @@ export class BookNavModal extends Modal {
     this.searchAbortSeq++;
     this.isSearching = false;
     try {
-      (this as any).shouldRestoreSelection = false;
+      this.shouldRestoreSelection = false;
       this.close();
     } catch {
       // Игнорируем
@@ -702,7 +696,7 @@ export class BookNavModal extends Modal {
   }
 
   onOpen() {
-    (this as any).shouldRestoreSelection = false;
+    this.shouldRestoreSelection = false;
     this.render();
   }
 
@@ -817,8 +811,8 @@ export class BookNavModal extends Modal {
       });
       left.createDiv({ cls: "my-epub-bm-sub", text: bm.createdAt });
       left.onclick = () => {
-        this.onJumpCfi(bm.cfi);
         this.safeClose();
+        this.onJumpCfi(bm.cfi);
       };
 
       const delBtn = row.createEl("button", {
@@ -892,8 +886,8 @@ export class BookNavModal extends Modal {
           text: item.excerpt,
         });
         main.onclick = () => {
-          this.onJumpCfi(item.cfi);
           this.safeClose();
+          this.onJumpCfi(item.cfi);
         };
       }
     };
@@ -919,13 +913,8 @@ export class BookNavModal extends Modal {
       this.searchStatusText = "Подготовка к поиску…";
       drawResults();
 
-      const spineItems: any[] = [];
-      const spineAny: any = this.book.spine;
-      if (typeof spineAny.each === "function") {
-        spineAny.each((item: any) => spineItems.push(item));
-      } else if (Array.isArray(spineAny.spineItems)) {
-        spineItems.push(...spineAny.spineItems);
-      }
+      const spineItems: Section[] = [];
+      this.book.spine.each((item: Section) => spineItems.push(item));
 
       const totalSections = spineItems.length;
 
@@ -960,12 +949,13 @@ export class BookNavModal extends Modal {
           // Проверяем наличие item.find в используемой версии epub.js
           if (typeof section.find === "function") {
             try {
-              const rawFound = section.find(q);
+              const rawFound: unknown = section.find(q);
               if (Array.isArray(rawFound)) {
-                sectionMatches = rawFound
-                  .filter((m: any) => m && typeof m.cfi === "string" && m.cfi.length > 0)
+                sectionMatches = (rawFound as unknown[])
+                  .filter((m): m is { cfi: string; excerpt?: unknown } =>
+                    isRecord(m) && typeof m.cfi === "string" && m.cfi.length > 0)
                   .slice(0, needed)
-                  .map((m: any) => ({
+                  .map(m => ({
                     cfi: String(m.cfi),
                     excerpt: String(m.excerpt || "").replace(/\s+/g, " ").trim(),
                   }));
@@ -1106,10 +1096,8 @@ export class BookNavModal extends Modal {
     }
     left.onclick = () => {
       if (w.cfi) {
-        this.onJumpCfi(w.cfi);
         this.safeClose();
-      } else {
-        speakEnglishText(w.word);
+        this.onJumpCfi(w.cfi);
       }
     };
 
@@ -1133,8 +1121,8 @@ export class BookNavModal extends Modal {
       });
       jumpBtn.onclick = (e) => {
         e.stopPropagation();
-        this.onJumpCfi(cfi);
         this.safeClose();
+        this.onJumpCfi(cfi);
       };
     }
   }
@@ -1149,8 +1137,8 @@ export class BookNavModal extends Modal {
     const cfi = q.cfi;
     if (cfi) {
       left.onclick = () => {
-        this.onJumpCfi(cfi);
         this.safeClose();
+        this.onJumpCfi(cfi);
       };
     }
   }
@@ -1170,8 +1158,8 @@ export class BookNavModal extends Modal {
       }
 
       row.onclick = () => {
-        this.onSelectToc(item.href);
         this.safeClose();
+        this.onSelectToc(item.href);
       };
       if (item.subitems && item.subitems.length > 0) {
         this.renderTocItems(container, item.subitems, level + 1);

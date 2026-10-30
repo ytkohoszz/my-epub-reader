@@ -9,6 +9,7 @@ import {
   migrateSettings,
 } from "./settings";
 import { EpubView } from "./view";
+import { toNavigationCfi } from "./navigation";
 
 export { EpubView } from "./view";
 export type { Settings, LocationIndexMeta } from "./settings";
@@ -17,6 +18,8 @@ export default class MyEpubPlugin extends Plugin {
   settings!: Settings;
   private saveTimer: number | null = null;
   private dirty = false;
+  private settingsRevision = 0;
+  private settingsWriteQueue: Promise<void> = Promise.resolve();
   private locationsIndex: Record<string, LocationIndexMeta> = {};
 
   async onload() {
@@ -98,7 +101,7 @@ export default class MyEpubPlugin extends Plugin {
 
     this.addCommand({
       id: "quick-translate-selected-word",
-      name: "Быстрый перевод и озвучка без сохранения в словарь",
+      name: "Быстрый перевод без сохранения в словарь",
       checkCallback: (checking: boolean) => {
         const view = this.app.workspace.getActiveViewOfType(EpubView);
         if (!view) return false;
@@ -316,8 +319,11 @@ export default class MyEpubPlugin extends Plugin {
   async reloadSettingsFromDisk() {
     if (this.dirty) return;
     try {
+      await this.settingsWriteQueue;
+      if (this.dirty) return;
+      const revision = this.settingsRevision;
       const diskData: unknown = await this.loadData();
-      if (diskData) {
+      if (diskData && !this.dirty && revision === this.settingsRevision) {
         this.settings = migrateSettings(diskData);
       }
     } catch {
@@ -364,12 +370,17 @@ export default class MyEpubPlugin extends Plugin {
       new Notice(`Файл книги «${clean}» не найден в хранилище.`);
       return;
     }
+    if (targetFile.extension.toLowerCase() !== "epub") {
+      new Notice("Ссылка должна вести на файл EPUB.");
+      return;
+    }
 
     await this.reloadSettingsFromDisk();
 
-    const navCfi = cfi && cfi.includes(",") ? cfi.replace(/,[^,)]+\)$/, ")") : cfi;
-    if (navCfi) {
-      this.setLocalBookProgress(targetFile.path, navCfi, new Date().toISOString());
+    const navCfi = toNavigationCfi(cfi);
+    if (cfi && !navCfi) {
+      new Notice("Ссылка содержит некорректную позицию в книге. Прогресс не изменён.");
+      return;
     }
 
     const existingLeaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
@@ -378,15 +389,32 @@ export default class MyEpubPlugin extends Plugin {
       if (view instanceof EpubView && view.file?.path === targetFile.path) {
         if (navCfi) view.ExplicitCfiJumpPending = true;
         this.app.workspace.setActiveLeaf(leaf, { focus: true });
-        if (navCfi) await view.jumpToCfi(navCfi, true);
+        try {
+          if (navCfi) await view.jumpToCfi(navCfi, true);
+        } finally {
+          if (!view.navigationInFlight) view.ExplicitCfiJumpPending = false;
+        }
         return;
       }
     }
 
     const leaf = this.app.workspace.getLeaf(false);
-    await leaf.openFile(targetFile);
-    if (navCfi && leaf.view instanceof EpubView) {
-      await leaf.view.jumpToCfi(navCfi, false);
+    if (navCfi) {
+      await leaf.setViewState({ type: VIEW_TYPE, active: true });
+      if (leaf.view instanceof EpubView) {
+        leaf.view.pendingOpenCfi = navCfi;
+      }
+    }
+    try {
+      await leaf.openFile(targetFile);
+      if (navCfi && leaf.view instanceof EpubView) {
+        await leaf.view.jumpToCfi(navCfi, false);
+      }
+    } finally {
+      if (leaf.view instanceof EpubView) {
+        leaf.view.pendingOpenCfi = null;
+        if (!leaf.view.navigationInFlight) leaf.view.ExplicitCfiJumpPending = false;
+      }
     }
   }
 
@@ -405,12 +433,12 @@ export default class MyEpubPlugin extends Plugin {
   }
 
   requestSaveSettings() {
+    this.settingsRevision++;
     this.dirty = true;
     if (this.saveTimer) window.clearTimeout(this.saveTimer);
     this.saveTimer = window.setTimeout(() => {
       this.saveTimer = null;
-      this.dirty = false;
-      void this.saveData(this.settings);
+      void this.flushSaveSettings();
     }, 400);
   }
 
@@ -421,8 +449,14 @@ export default class MyEpubPlugin extends Plugin {
     }
     if (this.dirty) {
       this.dirty = false;
-      await this.saveData(this.settings);
+      const snapshot = JSON.parse(JSON.stringify(this.settings)) as Settings;
+      const write = this.settingsWriteQueue.then(() => this.saveData(snapshot));
+      this.settingsWriteQueue = write.catch(() => {
+        this.dirty = true;
+        new Notice("Не удалось сохранить настройки читалки. Изменения будут сохранены повторно.");
+      });
     }
+    await this.settingsWriteQueue;
   }
 
   saveSettings() {
