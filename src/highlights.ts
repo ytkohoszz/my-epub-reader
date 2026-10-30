@@ -238,7 +238,6 @@ export async function loadBookAnnotationsFromVault(
   return { words: words.reverse(), quotes: quotes.reverse() };
 }
 
-// C4: учитываем как системную тёмную тему (body.theme-dark), так и локальные режимы «Ночь» / «Сепия»
 function highlightStyles(fill: string, opacity: string): Record<string, string> {
   const isNightView = document.querySelector(".view-content.my-epub.my-epub-is-night") !== null;
   const isSepiaView = document.querySelector(".view-content.my-epub.my-epub-is-sepia") !== null;
@@ -462,14 +461,14 @@ export function applyHighlightsToRendition(
   }
 }
 
-// --- Быстрый перевод на лету без сохранения в словарь ---
+// --- Быстрый перевод на лету без сохранения в словарь (без автоозвучки) ---
 export class QuickTranslateModal extends Modal {
   textToTranslate: string;
   onSaveToVocab: (word: string) => void;
 
   constructor(app: App, textToTranslate: string, onSaveToVocab: (word: string) => void) {
     super(app);
-    this.shouldRestoreSelection = false;
+    (this as unknown as { shouldRestoreSelection?: boolean }).shouldRestoreSelection = false;
     this.textToTranslate = textToTranslate;
     this.onSaveToVocab = onSaveToVocab;
     configureTranslationCache(app);
@@ -477,7 +476,7 @@ export class QuickTranslateModal extends Modal {
 
   safeClose() {
     try {
-      this.shouldRestoreSelection = false;
+      (this as unknown as { shouldRestoreSelection?: boolean }).shouldRestoreSelection = false;
       this.close();
     } catch {
       // Игнорируем
@@ -485,7 +484,7 @@ export class QuickTranslateModal extends Modal {
   }
 
   async onOpen() {
-    this.shouldRestoreSelection = false;
+    (this as unknown as { shouldRestoreSelection?: boolean }).shouldRestoreSelection = false;
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("my-epub-modal");
@@ -573,7 +572,6 @@ export class QuickTranslateModal extends Modal {
   }
 }
 
-// Вспомогательный ручной поиск по DOM секции, если item.find в epub.js недоступен
 function manualSearchInSectionDom(
   sectionItem: Section,
   query: string,
@@ -618,7 +616,7 @@ function manualSearchInSectionDom(
           results.push({ cfi, excerpt });
         }
       } catch {
-        // Игнорируем ошибку построения CFI для узла
+        // Игнорируем
       }
     }
     node = walker.nextNode();
@@ -627,7 +625,6 @@ function manualSearchInSectionDom(
   return results;
 }
 
-// --- Единое модальное окно навигации: 📑 Главы | 🔖 Закладки | 🎓 Слова и цитаты | 🔍 Поиск ---
 export class BookNavModal extends Modal {
   book: Book | null;
   toc: NavItem[];
@@ -669,7 +666,7 @@ export class BookNavModal extends Modal {
     }
   ) {
     super(app);
-    this.shouldRestoreSelection = false;
+    (this as unknown as { shouldRestoreSelection?: boolean }).shouldRestoreSelection = false;
     this.book = opts.book ?? null;
     this.toc = opts.toc;
     this.bookmarks = opts.bookmarks;
@@ -688,7 +685,7 @@ export class BookNavModal extends Modal {
     this.searchAbortSeq++;
     this.isSearching = false;
     try {
-      this.shouldRestoreSelection = false;
+      (this as unknown as { shouldRestoreSelection?: boolean }).shouldRestoreSelection = false;
       this.close();
     } catch {
       // Игнорируем
@@ -696,7 +693,7 @@ export class BookNavModal extends Modal {
   }
 
   onOpen() {
-    this.shouldRestoreSelection = false;
+    (this as unknown as { shouldRestoreSelection?: boolean }).shouldRestoreSelection = false;
     this.render();
   }
 
@@ -779,7 +776,6 @@ export class BookNavModal extends Modal {
       return;
     }
 
-    // Закладки
     const addRow = body.createDiv("my-epub-bm-top");
     const pageStr = this.currentPage
       ? `стр. ${this.currentPage} (${this.currentPct ?? 0}%)`
@@ -828,7 +824,6 @@ export class BookNavModal extends Modal {
     }
   }
 
-  // C1: Вкладка «🔍 Поиск» по главам книги через book.spine.each и item.find(query) (с фолбэком на item.load + DOM)
   renderSearchTab(parent: HTMLElement) {
     const controlsRow = parent.createDiv("my-epub-search-controls");
     const searchInput = controlsRow.createEl("input", {
@@ -927,7 +922,6 @@ export class BookNavModal extends Modal {
         statusEl.setText(this.searchStatusText);
         statusEl.style.display = "block";
 
-        // Уступаем поток UI между главами, чтобы кнопка «Стоп» оставалась отзывчивой
         await new Promise<void>((r) => window.setTimeout(r, 0));
         if (mySeq !== this.searchAbortSeq) return;
 
@@ -946,7 +940,6 @@ export class BookNavModal extends Modal {
           const needed = MAX_SEARCH_RESULTS - this.searchResults.length;
           let sectionMatches: Array<{ cfi: string; excerpt: string }> = [];
 
-          // Проверяем наличие item.find в используемой версии epub.js
           if (typeof section.find === "function") {
             try {
               const rawFound: unknown = section.find(q);
@@ -981,7 +974,7 @@ export class BookNavModal extends Modal {
             drawResults();
           }
         } catch {
-          // Пропускаем секцию при ошибке чтения
+          // Игнорируем
         } finally {
           if (loadedHere) {
             try {

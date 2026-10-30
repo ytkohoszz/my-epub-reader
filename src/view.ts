@@ -8,7 +8,7 @@ import {
   WorkspaceLeaf,
 } from "obsidian";
 import ePub, { Book, Rendition } from "epubjs";
-import { toNavigationCfi, withNavigationTimeout } from "./navigation";
+import { toNavigationCfi } from "./navigation";
 import {
   AddQuoteModal,
   AddWordModal,
@@ -120,7 +120,7 @@ class AppearanceModal extends Modal {
     contentEl.empty();
     contentEl.addClass("my-epub-modal", "my-epub-appear-modal");
 
-    const ver = this.view.plugin.manifest?.version || "0.2.8";
+    const ver = this.view.plugin.manifest?.version || "0.2.10";
     const head = contentEl.createDiv("my-epub-word-head");
     head.createSpan({
       cls: "my-epub-word-title",
@@ -454,8 +454,6 @@ export class EpubView extends FileView {
   activeBookFile: TFile | null = null;
   isClosing = false;
   private closingTask: Promise<void> | null = null;
-  private navigationRevision = 0;
-  private navigationQueue: Promise<unknown> = Promise.resolve();
   private yamlWriteQueue: Promise<void> = Promise.resolve();
   ExplicitCfiJumpPending = false;
   lastBoxWidth = 0;
@@ -510,6 +508,10 @@ export class EpubView extends FileView {
       this.app.workspace.on("active-leaf-change", () => {
         this.plugin.syncGlobalBodyClasses();
         this.recordReadingActivity();
+        // При переключении с читалки на вкладку дашборда сразу сбрасываем прогресс в YAML
+        if (this.app.workspace.activeLeaf?.view !== this) {
+          void this.flushYamlProgress();
+        }
       })
     );
   }
@@ -599,18 +601,12 @@ export class EpubView extends FileView {
 
     this.trySilentResolveLinkedBookNote(file);
     const initialPos = resolveInitialCfiBeforeRender(this, file);
-    this.stableCfi = toNavigationCfi(this.pendingOpenCfi) ?? initialPos.cfi;
-    const rawLocalPosition: unknown = this.plugin.settings.progress[file.path];
-    const initialLinkedBook = this.linkedBookNote as BookNoteInfo | null;
-    const rawYamlPosition: unknown = initialLinkedBook
-      ? this.app.metadataCache.getFileCache(initialLinkedBook.file)?.frontmatter?.["позиция"] : null;
-    if (!this.stableCfi &&
-        ((typeof rawLocalPosition === "string" && rawLocalPosition.trim()) ||
-         (typeof rawYamlPosition === "string" && rawYamlPosition.trim()))) {
-      this.progressPersistenceBlocked = true;
-      new Notice("Сохранённый адрес позиции повреждён. Прежний прогресс не будет перезаписан, пока ты не выберешь страницу.");
-    }
-    this.lastLocalPositionSavedAt = initialPos.savedAt;
+    const openTargetCfi = toNavigationCfi(this.pendingOpenCfi);
+    this.pendingOpenCfi = null;
+    this.stableCfi = openTargetCfi ?? initialPos.cfi;
+    this.lastLocalPositionSavedAt = openTargetCfi
+      ? new Date().toISOString()
+      : initialPos.savedAt;
 
     this.wrapEl = root.createDiv("my-epub-wrap");
     this.boxEl = this.wrapEl.createDiv("my-epub-box");
@@ -789,10 +785,6 @@ export class EpubView extends FileView {
         await this.rendition.display(this.stableCfi || undefined);
       } catch {
         if (currentLoadId !== this.loadId || this.isClosing || !this.rendition) return;
-        if (this.stableCfi) {
-          this.progressPersistenceBlocked = true;
-          new Notice("Сохранённая позиция недоступна. Открыто начало книги без перезаписи прогресса; выбери нужную страницу.");
-        }
         this.stableCfi = null;
         await this.rendition.display();
       }
@@ -826,10 +818,11 @@ export class EpubView extends FileView {
 
       const rendExt = this.rendition as unknown as EpubRenditionExtended;
       const cur = rendExt.currentLocation?.();
-      if (!this.navigationInFlight && cur?.start?.cfi) {
-        captureChapterMetricsFromLoc(this, cur);
-        if (!this.stableCfi || this.userHasNavigated) this.stableCfi = cur.start.cfi;
-        this.updateProgressLabels(this.stableCfi);
+      const curCfi = toNavigationCfi(cur?.start?.cfi);
+      if (curCfi) {
+        if (cur) captureChapterMetricsFromLoc(this, cur);
+        this.stableCfi = curCfi;
+        this.updateProgressLabels(curCfi);
       }
 
       if (loadedFromCache) {
@@ -864,10 +857,7 @@ export class EpubView extends FileView {
     const prev = this.navHistory.pop();
     this.updateBackPillState();
     if (!prev) return;
-    if (!await this.jumpToCfi(prev.cfi, false)) {
-      this.navHistory.push(prev);
-      this.updateBackPillState();
-    }
+    await this.jumpToCfi(prev.cfi, false);
   }
 
   updateBackPillState() {
@@ -975,98 +965,83 @@ export class EpubView extends FileView {
 
   openJumpModal() {
     if (!this.book) return;
-    if (!this.totalPagesNum || this.totalPagesNum <= 0) {
-      new Notice(this.isGeneratingLocations
-        ? "Номера страниц ещё готовятся. Подожди немного."
-        : "Номера страниц недоступны. Переоткрой книгу для повторной попытки.");
+    const total = this.totalPagesNum || this.book.locations.length();
+    if (!total || total <= 0) {
+      new Notice("Страницы ещё считаются — подожди пару секунд.");
       return;
     }
+    this.totalPagesNum = total;
     this.prepareMainWindowFocusBeforeModal();
     const curPage = this.currentPageNum ?? 1;
     new JumpToPageModal(
       this.app,
       curPage,
-      this.totalPagesNum,
+      total,
       this.getChapterSummaryText(),
       (targetPage) => {
         const targetCfi = getCfiFromPageNumberSafe(this, targetPage);
         if (targetCfi) {
           void this.jumpToCfi(targetCfi, true);
+        } else {
+          new Notice("Не удалось вычислить адрес выбранной страницы.");
         }
       }
     ).open();
   }
 
   async jumpToCfi(cfi: string, recordHistory = false): Promise<boolean> {
+    if (!cfi) return false;
     const navCfi = toNavigationCfi(cfi);
     if (!navCfi) {
-      new Notice("Не удалось прочитать позицию в книге. Переход отменён.");
+      new Notice("Не удалось прочитать позицию в книге.");
       return false;
     }
     return this.navigateTo(navCfi, recordHistory);
   }
 
   private async navigateTo(target: string, recordHistory = false): Promise<boolean> {
-    if (this.isClosing) return false;
-    const rendition = this.rendition;
-    const file = this.file;
-    if (!rendition || !file) {
-      new Notice("Книга ещё не готова к переходу. Дождись загрузки и повтори.");
-      return false;
+    if (this.isClosing || !this.rendition) return false;
+    this.recordReadingActivity();
+    if (recordHistory) this.pushNavHistory();
+
+    if (this.resizeTimer !== null) {
+      window.clearTimeout(this.resizeTimer);
+      this.resizeTimer = null;
     }
-    const loadId = this.loadId;
-    const revision = ++this.navigationRevision;
-    if (this.resizeTimer !== null) window.clearTimeout(this.resizeTimer);
-    this.resizeTimer = null;
     this.isResizing = false;
     this.userHasNavigated = true;
-    this.navigationInFlight = true;
+    this.progressPersistenceBlocked = false;
     this.ExplicitCfiJumpPending = true;
-    this.recordReadingActivity();
-    const isCurrent = () => loadId === this.loadId &&
-      rendition === this.rendition && revision === this.navigationRevision;
-    const run = async (): Promise<boolean> => {
-      if (!isCurrent()) return false;
-      const previous = this.stableCfi && this.currentPageNum !== null
-        ? { cfi: this.stableCfi, page: this.currentPageNum } : null;
-      try {
-        await withNavigationTimeout(rendition.display(target));
-        if (!isCurrent()) return false;
-        const loc = (rendition as unknown as EpubRenditionExtended).currentLocation?.();
-        const actualCfi = toNavigationCfi(loc?.start?.cfi);
-        if (!actualCfi) throw new Error("Читалка не подтвердила новую позицию");
-        if (recordHistory && previous) {
-          const last = this.navHistory[this.navHistory.length - 1];
-          if (last?.cfi !== previous.cfi) this.navHistory.push(previous);
-          if (this.navHistory.length > 10) this.navHistory.shift();
-          this.updateBackPillState();
-        }
+    this.navigationInFlight = true;
+
+    try {
+      await this.rendition.display(target);
+      const rendExt = this.rendition as unknown as EpubRenditionExtended;
+      const loc = rendExt.currentLocation?.();
+      const actualCfi = toNavigationCfi(loc?.start?.cfi) || toNavigationCfi(target);
+
+      if (actualCfi) {
         const nowIso = new Date().toISOString();
         this.stableCfi = actualCfi;
-        this.progressPersistenceBlocked = false;
-        this.pendingOpenCfi = null;
         this.lastLocalPositionSavedAt = nowIso;
-        this.plugin.setLocalBookProgress(file.path, actualCfi, nowIso);
+        const file = this.activeBookFile ?? this.file;
+        if (file) {
+          this.plugin.setLocalBookProgress(file.path, actualCfi, nowIso);
+        }
         if (loc) captureChapterMetricsFromLoc(this, loc);
         this.updateProgressLabels(actualCfi);
-        if (this.isInitialLoadDone) this.requestYamlProgressSync();
-        return true;
-      } catch (error: unknown) {
-        if (isCurrent()) {
-          this.progressPersistenceBlocked = true;
-          new Notice(`Не удалось перейти: ${getErrorMessage(error)}. Прежний прогресс не перезаписан.`);
-        }
-        return false;
-      } finally {
-        if (isCurrent()) {
-          this.ExplicitCfiJumpPending = false;
-          this.navigationInFlight = false;
+        if (this.isInitialLoadDone) {
+          this.requestYamlProgressSync();
         }
       }
-    };
-    const task = this.navigationQueue.then(run, run);
-    this.navigationQueue = task;
-    return task;
+      return true;
+    } catch (err: unknown) {
+      new Notice(`Не удалось перейти: ${getErrorMessage(err)}`);
+      return false;
+    } finally {
+      this.ExplicitCfiJumpPending = false;
+      this.navigationInFlight = false;
+    }
   }
 
   clearCapturedSelection() {
@@ -1119,18 +1094,21 @@ export class EpubView extends FileView {
     if (!this.navigationInFlight) this.ExplicitCfiJumpPending = false;
     const file = this.activeBookFile ?? this.file;
     const cfi = toNavigationCfi(this.stableCfi);
-    if (file && cfi && !this.progressPersistenceBlocked && !this.navigationInFlight) {
-      // Merely reopening must keep the chosen anchor and its original timestamp.
-      const savedAt = this.lastLocalPositionSavedAt ||
-        this.plugin.settings.progressUpdatedAt?.[file.path] || new Date().toISOString();
+    if (file && cfi && !this.navigationInFlight) {
+      const savedAt =
+        this.lastLocalPositionSavedAt ||
+        this.plugin.settings.progressUpdatedAt?.[file.path] ||
+        new Date().toISOString();
       this.lastLocalPositionSavedAt = savedAt;
       this.plugin.setLocalBookProgress(file.path, cfi, savedAt);
+      this.updateProgressLabels(cfi);
     }
     this.requestYamlProgressSync();
   }
 
   requestYamlProgressSync() {
-    if (!this.isInitialLoadDone || this.progressPersistenceBlocked || this.isClosing) return;
+    if (!this.isInitialLoadDone || this.isClosing) return;
+    if (this.navHistory.length > 0) return;
     const file = this.activeBookFile ?? this.file;
     if (!this.linkedBookNote || !file) return;
     if (this.linkedBookNote.linkedEpubPath !== file.path) return;
@@ -1310,8 +1288,7 @@ export class EpubView extends FileView {
   }
 
   turnPage(dir: "next" | "prev") {
-    if (!this.rendition || this.ExplicitCfiJumpPending || this.isClosing) return;
-    this.navigationRevision++;
+    if (!this.rendition || this.isClosing) return;
     this.userHasNavigated = true;
     this.progressPersistenceBlocked = false;
     this.recordReadingActivity();
@@ -1348,9 +1325,9 @@ export class EpubView extends FileView {
     }
 
     if (dir === "next") {
-      void this.rendition.next().catch((error: unknown) => new Notice(`Не удалось перелистнуть: ${getErrorMessage(error)}`));
+      void this.rendition.next();
     } else {
-      void this.rendition.prev().catch((error: unknown) => new Notice(`Не удалось перелистнуть: ${getErrorMessage(error)}`));
+      void this.rendition.prev();
     }
   }
 
@@ -1429,15 +1406,12 @@ export class EpubView extends FileView {
     const savedAnchor = this.stableCfi;
     const rendition = this.rendition;
     const loadId = this.loadId;
-    const revision = this.navigationRevision;
-    const isCurrent = () => rendition === this.rendition &&
-      loadId === this.loadId && revision === this.navigationRevision;
+    const isCurrent = () => rendition === this.rendition && loadId === this.loadId;
     this.isResizing = true;
     if (this.resizeTimer) window.clearTimeout(this.resizeTimer);
 
     this.resizeTimer = window.setTimeout(() => {
-      if (!isCurrent()) return;
-      if (!this.boxEl) {
+      if (!isCurrent() || !this.boxEl) {
         this.isResizing = false;
         return;
       }
@@ -1454,10 +1428,9 @@ export class EpubView extends FileView {
       rendition.resize(w, h);
 
       this.resizeTimer = window.setTimeout(async () => {
-        if (!isCurrent()) {
-          return;
-        }
+        if (!isCurrent()) return;
         if (savedAnchor) {
+          this.stableCfi = savedAnchor;
           try {
             await rendition.display(savedAnchor);
           } catch {
@@ -1510,25 +1483,17 @@ export class EpubView extends FileView {
 
   applyStylesAndRestore() {
     if (!this.rendition || this.isClosing) return;
-    if (this.ExplicitCfiJumpPending) {
-      const loadId = this.loadId;
-      void this.navigationQueue.then(() => {
-        if (loadId === this.loadId) this.applyStylesAndRestore();
-      });
-      return;
-    }
     const targetCfi = this.stableCfi;
     const rendition = this.rendition;
     const loadId = this.loadId;
-    const revision = this.navigationRevision;
-    const isCurrent = () => rendition === this.rendition &&
-      loadId === this.loadId && revision === this.navigationRevision;
+    const isCurrent = () => rendition === this.rendition && loadId === this.loadId;
     this.isResizing = true;
     this.applyStyles();
     if (this.resizeTimer) window.clearTimeout(this.resizeTimer);
     this.resizeTimer = window.setTimeout(async () => {
       if (!isCurrent()) return;
       if (targetCfi) {
+        this.stableCfi = targetCfi;
         try {
           await rendition.display(targetCfi);
         } catch {
@@ -1666,6 +1631,7 @@ export class EpubView extends FileView {
 
   updateProgressLabels(cfi: string) {
     if (!this.book) return;
+    const cleanCfi = toNavigationCfi(cfi) || cfi;
     const total = this.book.locations.length();
     const bmMark = this.isCurrentPageBookmarked() ? "🔖 " : "";
     let chapterLeftSuffix = "";
@@ -1679,15 +1645,14 @@ export class EpubView extends FileView {
       this.info.setAttr("title", `${summary}. Нажми для быстрого перехода.`);
     }
 
-    if (Number.isInteger(total) && total > 0) {
-      const idx = Number(this.book.locations.locationFromCfi(cfi));
-      const fraction = this.book.locations.percentageFromCfi(cfi);
-      if (!Number.isFinite(idx) || idx < 0 || !Number.isFinite(fraction)) return;
+    if (total > 0 && cleanCfi) {
+      const rawIdx = Number(this.book.locations.locationFromCfi(cleanCfi));
+      const rawFrac = this.book.locations.percentageFromCfi(cleanCfi);
+      const idx = Number.isFinite(rawIdx) && rawIdx >= 0 ? rawIdx : 0;
       const page = Math.max(1, Math.min(total, idx + 1));
-      const pct = Math.max(
-        0,
-        Math.min(100, Math.round(fraction * 100))
-      );
+      const pct = Number.isFinite(rawFrac) && rawFrac >= 0
+        ? Math.max(0, Math.min(100, Math.round(rawFrac * 100)))
+        : Math.max(0, Math.min(100, Math.round((page / total) * 100)));
 
       this.currentPageNum = page;
       this.totalPagesNum = total;
@@ -1697,7 +1662,7 @@ export class EpubView extends FileView {
       this.info.setText(`${bmMark}стр. ${page} / ${total} · ${pct}%${chapterLeftSuffix}`);
       this.fsInfoEl?.setText(`${bmMark}${page}/${total} · ${pct}% ⛶`);
     } else {
-      const fastPct = computeFastPercentage(this, cfi);
+      const fastPct = computeFastPercentage(this, cleanCfi);
       this.info.setText(`${bmMark}~${fastPct}%${chapterLeftSuffix} · считаю стр.…`);
       this.fsInfoEl?.setText(`${bmMark}~${fastPct}% ⛶`);
     }
@@ -1706,36 +1671,39 @@ export class EpubView extends FileView {
   onRelocated(file: TFile, loc: EpubRelocatedEvent) {
     if (this.isClosing || (this.activeBookFile ?? this.file)?.path !== file.path) return;
     if (!this.containerEl.isConnected) return;
-    if (this.boxEl && (!this.boxEl.isConnected ||
-        this.boxEl.clientWidth <= 0 || this.boxEl.clientHeight <= 0)) return;
-    const cfi = loc?.start?.cfi;
+    if (
+      this.boxEl &&
+      (!this.boxEl.isConnected || this.boxEl.clientWidth <= 0 || this.boxEl.clientHeight <= 0)
+    ) {
+      return;
+    }
+
+    const cfi = toNavigationCfi(loc?.start?.cfi);
     if (!cfi || !this.book) return;
 
-    if (this.isResizing || this.ExplicitCfiJumpPending) return;
-    // Opening, font reflow and delayed startup reports are not reading
-    // navigation. Preserve the resume anchor until an actual navigation action.
-    if (!this.userHasNavigated) return;
+    if ((this.isResizing || document.querySelector(".modal-container")) && this.stableCfi) {
+      return;
+    }
 
     this.recordReadingActivity();
     captureChapterMetricsFromLoc(this, loc);
     this.stableCfi = cfi;
 
-    if (this.progressPersistenceBlocked) {
+    if (this.isInitialLoadDone || this.userHasNavigated) {
+      const nowIso = new Date().toISOString();
+      this.lastLocalPositionSavedAt = nowIso;
+      this.plugin.setLocalBookProgress(file.path, cfi, nowIso);
       this.updateProgressLabels(cfi);
-      return;
+      this.requestYamlProgressSync();
+    } else {
+      this.plugin.settings.progress[file.path] = cfi;
+      this.plugin.requestSaveSettings();
+      this.updateProgressLabels(cfi);
     }
-    const nowIso = new Date().toISOString();
-    this.lastLocalPositionSavedAt = nowIso;
-    this.plugin.setLocalBookProgress(file.path, cfi, nowIso);
-
-    this.updateProgressLabels(cfi);
-    this.requestYamlProgressSync();
   }
 
   cleanupView() {
     this.loadId++;
-    this.navigationRevision++;
-    this.navigationQueue = Promise.resolve();
     this.navigationInFlight = false;
     this.ExplicitCfiJumpPending = Boolean(this.pendingOpenCfi);
     this.isFullscreen = false;
@@ -1774,25 +1742,22 @@ export class EpubView extends FileView {
 
   private finishReading(): Promise<void> {
     if (this.closingTask) return this.closingTask;
-    // Freeze before the first await: detached/resized iframes can emit one last
-    // relocated event while Obsidian is closing a tab or changing its file.
     this.isClosing = true;
-    this.navigationRevision++;
     this.navigationInFlight = false;
     this.ExplicitCfiJumpPending = false;
     this.isResizing = false;
     if (this.resizeTimer !== null) window.clearTimeout(this.resizeTimer);
     this.resizeTimer = null;
+
     const file = this.activeBookFile ?? this.file;
     const cfi = toNavigationCfi(this.stableCfi);
-    if (file && cfi && (this.isInitialLoadDone || this.userHasNavigated) &&
-        !this.progressPersistenceBlocked) {
-      const savedAt = this.lastLocalPositionSavedAt ||
-        this.plugin.settings.progressUpdatedAt?.[file.path] || new Date().toISOString();
-      this.lastLocalPositionSavedAt = savedAt;
-      this.plugin.setLocalBookProgress(file.path, cfi, savedAt);
+    if (file && cfi && (this.isInitialLoadDone || this.userHasNavigated)) {
+      const nowIso = new Date().toISOString();
+      this.lastLocalPositionSavedAt = nowIso;
+      this.plugin.setLocalBookProgress(file.path, cfi, nowIso);
       this.pendingYamlSync = true;
     }
+
     this.closingTask = (async () => {
       await this.flushYamlProgress();
       this.cleanupView();

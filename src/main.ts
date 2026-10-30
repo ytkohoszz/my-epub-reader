@@ -304,7 +304,8 @@ export default class MyEpubPlugin extends Plugin {
   }
 
   setLocalBookProgress(filePath: string, cfi: string, isoTime = new Date().toISOString()) {
-    this.settings.progress[filePath] = cfi;
+    const navCfi = toNavigationCfi(cfi) || cfi;
+    this.settings.progress[filePath] = navCfi;
     if (!this.settings.progressUpdatedAt) {
       this.settings.progressUpdatedAt = {};
     }
@@ -370,17 +371,12 @@ export default class MyEpubPlugin extends Plugin {
       new Notice(`Файл книги «${clean}» не найден в хранилище.`);
       return;
     }
-    if (targetFile.extension.toLowerCase() !== "epub") {
-      new Notice("Ссылка должна вести на файл EPUB.");
-      return;
-    }
 
     await this.reloadSettingsFromDisk();
 
-    const navCfi = toNavigationCfi(cfi);
-    if (cfi && !navCfi) {
-      new Notice("Ссылка содержит некорректную позицию в книге. Прогресс не изменён.");
-      return;
+    const navCfi = cfi ? toNavigationCfi(cfi) : null;
+    if (navCfi) {
+      this.setLocalBookProgress(targetFile.path, navCfi, new Date().toISOString());
     }
 
     const existingLeaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
@@ -389,32 +385,15 @@ export default class MyEpubPlugin extends Plugin {
       if (view instanceof EpubView && view.file?.path === targetFile.path) {
         if (navCfi) view.ExplicitCfiJumpPending = true;
         this.app.workspace.setActiveLeaf(leaf, { focus: true });
-        try {
-          if (navCfi) await view.jumpToCfi(navCfi, true);
-        } finally {
-          if (!view.navigationInFlight) view.ExplicitCfiJumpPending = false;
-        }
+        if (navCfi) await view.jumpToCfi(navCfi, true);
         return;
       }
     }
 
     const leaf = this.app.workspace.getLeaf(false);
-    if (navCfi) {
-      await leaf.setViewState({ type: VIEW_TYPE, active: true });
-      if (leaf.view instanceof EpubView) {
-        leaf.view.pendingOpenCfi = navCfi;
-      }
-    }
-    try {
-      await leaf.openFile(targetFile);
-      if (navCfi && leaf.view instanceof EpubView) {
-        await leaf.view.jumpToCfi(navCfi, false);
-      }
-    } finally {
-      if (leaf.view instanceof EpubView) {
-        leaf.view.pendingOpenCfi = null;
-        if (!leaf.view.navigationInFlight) leaf.view.ExplicitCfiJumpPending = false;
-      }
+    await leaf.openFile(targetFile);
+    if (navCfi && leaf.view instanceof EpubView) {
+      await leaf.view.jumpToCfi(navCfi, false);
     }
   }
 
@@ -453,7 +432,6 @@ export default class MyEpubPlugin extends Plugin {
       const write = this.settingsWriteQueue.then(() => this.saveData(snapshot));
       this.settingsWriteQueue = write.catch(() => {
         this.dirty = true;
-        new Notice("Не удалось сохранить настройки читалки. Изменения будут сохранены повторно.");
       });
     }
     await this.settingsWriteQueue;
@@ -469,8 +447,6 @@ export default class MyEpubPlugin extends Plugin {
       window.clearTimeout(this.saveTimer);
       this.saveTimer = null;
     }
-    void this.flushAllViewsAndSettings().catch((error: unknown) => {
-      console.error("MyEpubPlugin final save:", error);
-    });
+    void this.flushAllViewsAndSettings();
   }
 }

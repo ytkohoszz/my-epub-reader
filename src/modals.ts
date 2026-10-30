@@ -15,7 +15,6 @@ export const normStr = (s: string) => String(s ?? "").trim().toLowerCase().repla
 export const normText = (s: string) =>
   String(s ?? "").toLowerCase().replace(/[“”"']/g, "").replace(/\s+/g, " ").trim();
 
-// B4: лёгкая нормализация окончаний (-s, -es, -ed, -ing, -ly) только для ключа поиска дублей
 function lightStemToken(token: string): string {
   const w = token.trim();
   if (w.length < 4) return w;
@@ -233,7 +232,6 @@ export async function ensureQuotesFile(app: App, quotesFilePath: string): Promis
   return await app.vault.create(quotesFilePath, initialContent);
 }
 
-// --- B1: Переводчик с постоянным кэшем в отдельном JSON плагина (лимит 2000, ленивая загрузка, debounce) ---
 export interface TranslationGroup {
   pos: string;
   terms: string[];
@@ -302,7 +300,7 @@ async function ensureTranslationCacheLoaded(): Promise<void> {
         }
       }
     } catch {
-      // Игнорируем ошибку чтения кэша переводов
+      // Игнорируем
     } finally {
       cacheLoadedFromDisk = true;
       cacheLoadPromise = null;
@@ -337,7 +335,7 @@ function scheduleSaveTranslationCache() {
       }
       await resolved.adapter.write(resolved.path, JSON.stringify(obj));
     } catch {
-      // Игнорируем ошибку фоновой записи кэша
+      // Игнорируем
     }
   }, TRANSLATION_CACHE_DEBOUNCE_MS);
 }
@@ -530,7 +528,6 @@ function parseExistingWordsForDuplicates(content: string): ExistingWordCard[] {
   return result;
 }
 
-// B2: Парсер существующих цитат для проверки дублей внутри выбранной книги
 interface ExistingQuoteRecord {
   lineNumber: number;
   text: string;
@@ -591,27 +588,26 @@ function isQuoteInSelectedBook(q: ExistingQuoteRecord, book: BookNoteInfo | null
 
 function safeCloseModal(modal: Modal) {
   try {
-    modal.shouldRestoreSelection = false;
+    (modal as unknown as { shouldRestoreSelection?: boolean }).shouldRestoreSelection = false;
     modal.close();
   } catch (e) {
     console.log("Safe modal close:", e);
   }
 }
 
-// --- 1. Оглавление ---
 export class TocModal extends Modal {
   toc: NavItem[];
   onSelect: (href: string) => void;
 
   constructor(app: App, toc: NavItem[], onSelect: (href: string) => void) {
     super(app);
-    this.shouldRestoreSelection = false;
+    (this as unknown as { shouldRestoreSelection?: boolean }).shouldRestoreSelection = false;
     this.toc = toc;
     this.onSelect = onSelect;
   }
 
   onOpen() {
-    this.shouldRestoreSelection = false;
+    (this as unknown as { shouldRestoreSelection?: boolean }).shouldRestoreSelection = false;
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("my-epub-toc-modal");
@@ -646,7 +642,6 @@ export class TocModal extends Modal {
   }
 }
 
-// --- 1.5. Быстрый переход к странице или проценту ---
 export class JumpToPageModal extends Modal {
   currentPage: number;
   totalPages: number;
@@ -661,7 +656,7 @@ export class JumpToPageModal extends Modal {
     onJumpPage: (page: number) => void
   ) {
     super(app);
-    this.shouldRestoreSelection = false;
+    (this as unknown as { shouldRestoreSelection?: boolean }).shouldRestoreSelection = false;
     this.currentPage = currentPage;
     this.totalPages = totalPages;
     this.chapterInfoText = chapterInfoText;
@@ -669,7 +664,7 @@ export class JumpToPageModal extends Modal {
   }
 
   onOpen() {
-    this.shouldRestoreSelection = false;
+    (this as unknown as { shouldRestoreSelection?: boolean }).shouldRestoreSelection = false;
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("my-epub-modal");
@@ -737,14 +732,15 @@ export class JumpToPageModal extends Modal {
     let submitted = false;
     const doJump = () => {
       if (submitted) return;
-      const input = Number(pageInput.value);
-      if (!pageInput.value.trim() || !Number.isFinite(input) || !Number.isInteger(input) || input < 1 || input > this.totalPages) {
-        new Notice(`Введи целую страницу от 1 до ${this.totalPages}.`);
+      const raw = Number(pageInput.value);
+      if (!pageInput.value.trim() || !Number.isFinite(raw)) {
+        new Notice(`Введи номер страницы от 1 до ${this.totalPages}.`);
         return;
       }
+      const clamped = Math.max(1, Math.min(this.totalPages, Math.round(raw)));
       submitted = true;
       safeCloseModal(this);
-      this.onJumpPage(input);
+      this.onJumpPage(clamped);
     };
 
     goBtn.onclick = doJump;
@@ -767,7 +763,6 @@ export class JumpToPageModal extends Modal {
   }
 }
 
-// --- 2. Привязка или создание заметки книги ---
 export class BookLinkModal extends Modal {
   epubFile: TFile;
   booksFolder: string;
@@ -794,7 +789,7 @@ export class BookLinkModal extends Modal {
     onResolved: (bookNote: BookNoteInfo) => void
   ) {
     super(app);
-    this.shouldRestoreSelection = false;
+    (this as unknown as { shouldRestoreSelection?: boolean }).shouldRestoreSelection = false;
     this.epubFile = epubFile;
     this.booksFolder = booksFolder;
     this.candidates = candidates;
@@ -808,7 +803,7 @@ export class BookLinkModal extends Modal {
   }
 
   onOpen() {
-    this.shouldRestoreSelection = false;
+    (this as unknown as { shouldRestoreSelection?: boolean }).shouldRestoreSelection = false;
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("my-epub-modal");
@@ -1048,7 +1043,7 @@ export class BookLinkModal extends Modal {
   }
 }
 
-// --- 3. Модальное окно «+ Слово» (B5: cachedRead при открытии, vault.read перед записью) ---
+// --- 3. Модальное окно «+ Слово» (без поля примера из книги) ---
 export class AddWordModal extends Modal {
   plugin: MyEpubPlugin;
   initialWord: string;
@@ -1068,7 +1063,7 @@ export class AddWordModal extends Modal {
     allBooks: BookNoteInfo[]
   ) {
     super(app);
-    this.shouldRestoreSelection = false;
+    (this as unknown as { shouldRestoreSelection?: boolean }).shouldRestoreSelection = false;
     this.plugin = plugin;
     this.initialWord = initialWord;
     this.capturedCfi = capturedCfi;
@@ -1078,7 +1073,7 @@ export class AddWordModal extends Modal {
   }
 
   async onOpen() {
-    this.shouldRestoreSelection = false;
+    (this as unknown as { shouldRestoreSelection?: boolean }).shouldRestoreSelection = false;
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("my-epub-modal");
@@ -1086,7 +1081,6 @@ export class AddWordModal extends Modal {
     const wordsFile = this.resolveWordsFile();
     if (wordsFile) {
       try {
-        // B5: используем cachedRead при открытии модального окна
         const raw = await this.app.vault.cachedRead(wordsFile);
         this.existingCards = parseExistingWordsForDuplicates(raw);
       } catch {
@@ -1117,7 +1111,7 @@ export class AddWordModal extends Modal {
       text: "🌐 Перевести",
     });
 
-    const ruInput = mainRow.createEl("input", {
+    const ruInput = contentEl.createEl("input", {
       cls: "my-epub-input-ru",
       type: "text",
       placeholder: "Перевод (RU) *",
@@ -1287,7 +1281,6 @@ export class AddWordModal extends Modal {
       let noticeText = "";
 
       try {
-        // B5: перед записью читаем актуальное содержимое через vault.read
         const freshContent = await this.app.vault.read(targetWordsFile);
         const freshCards = parseExistingWordsForDuplicates(freshContent);
         const k = wordKey(en);
@@ -1324,32 +1317,8 @@ export class AddWordModal extends Modal {
           backWithSource = `${ru} · ${wiki}`;
         }
 
-        // Recheck in the atomic operation: another window/plugin may have
-        // modified the dictionary after the initial read.
-        let appended = false;
-        let latestSame: ExistingWordCard[] = [];
-        await this.app.vault.process(targetWordsFile, content => {
-          latestSame = parseExistingWordsForDuplicates(content).filter(card => card.key === k);
-          const duplicate = latestSame.some(card => normText(card.back) === normText(ru));
-          const needsConfirmation = latestSame.length > 0 && pendingKey !== `${k}|${normText(ru)}`;
-          if (duplicate || needsConfirmation) return content;
-          const prefix = content.length > 0 && !content.endsWith("\n") ? "\n" : "";
-          appended = true;
-          return `${content}${prefix}${front} ::: ${backWithSource}\n`;
-        });
-        if (!appended) {
-          showDup(latestSame);
-          const duplicate = latestSame.some(card => normText(card.back) === normText(ru));
-          if (duplicate) {
-            new Notice("Такая карточка с этим переводом уже есть — дубликат не добавлен.");
-          } else {
-            pendingKey = `${k}|${normText(ru)}`;
-            addBtn.setText("Всё равно добавить");
-            new Notice("Словарь изменился. Нажми ещё раз, чтобы добавить другой перевод.");
-          }
-          addBtn.disabled = false;
-          return;
-        }
+        const prefix = freshContent.length > 0 && !freshContent.endsWith("\n") ? "\n" : "";
+        await this.app.vault.append(targetWordsFile, `${prefix}${front} ::: ${backWithSource}\n`);
 
         savedSuccessfully = true;
         noticeText = `✓ Добавлено: ${front} ::: ${ru}${chosenBook ? " (" + chosenBook.title + ")" : ""}`;
@@ -1405,7 +1374,6 @@ export class AddWordModal extends Modal {
   }
 }
 
-// --- 4. Модальное окно «+ Цитата» (B2: проверка дублей по normText внутри выбранной книги) ---
 export class AddQuoteModal extends Modal {
   plugin: MyEpubPlugin;
   initialQuote: string;
@@ -1423,7 +1391,7 @@ export class AddQuoteModal extends Modal {
     allBooks: BookNoteInfo[]
   ) {
     super(app);
-    this.shouldRestoreSelection = false;
+    (this as unknown as { shouldRestoreSelection?: boolean }).shouldRestoreSelection = false;
     this.plugin = plugin;
     this.initialQuote = initialQuote;
     this.capturedCfi = capturedCfi;
@@ -1432,7 +1400,7 @@ export class AddQuoteModal extends Modal {
   }
 
   async onOpen() {
-    this.shouldRestoreSelection = false;
+    (this as unknown as { shouldRestoreSelection?: boolean }).shouldRestoreSelection = false;
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("my-epub-modal");

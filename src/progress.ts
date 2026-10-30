@@ -1,4 +1,4 @@
-import { Notice, TFile } from "obsidian";
+import { TFile } from "obsidian";
 import { toNavigationCfi } from "./navigation";
 import { NavItem } from "epubjs";
 import { getTodayISO } from "./modals";
@@ -78,10 +78,15 @@ export function computeFastPercentage(
 ): number {
   if (!view.book) return view.approxProgressPct ?? 0;
 
-  if (view.book.locations && view.book.locations.length() > 0) {
-    const p = view.book.locations.percentageFromCfi(cfi);
-    if (typeof p === "number" && Number.isFinite(p)) {
-      return Math.max(0, Math.min(100, Math.round(p * 100)));
+  const cleanCfi = toNavigationCfi(cfi) || cfi;
+  if (view.book.locations && view.book.locations.length() > 0 && cleanCfi) {
+    try {
+      const p = view.book.locations.percentageFromCfi(cleanCfi);
+      if (typeof p === "number" && Number.isFinite(p) && p >= 0) {
+        return Math.max(0, Math.min(100, Math.round(p * 100)));
+      }
+    } catch {
+      // Игнорируем
     }
   }
 
@@ -161,33 +166,38 @@ export function buildChapterSummaryText(view: EpubView): string {
 }
 
 export function getCfiFromPageNumberSafe(view: EpubView, page: number): string | null {
-  if (!view.book || !Number.isInteger(page) || !Number.isInteger(view.totalPagesNum) ||
-      !view.totalPagesNum || view.totalPagesNum <= 0) return null;
-  if (page < 1 || page > view.totalPagesNum) return null;
-  const total = view.totalPagesNum;
+  if (!view.book) return null;
+  const total = view.totalPagesNum || view.book.locations.length();
+  if (!total || total <= 0) return null;
+
   const clampedPage = Math.max(1, Math.min(total, Math.round(page)));
   const idx = clampedPage - 1;
   const locs = view.book.locations as unknown as EpubLocationsExtended;
 
+  // 1. Сначала берём из внутреннего массива _locations и обязательно сворачиваем диапазон через toNavigationCfi
+  const fromArr = locs._locations?.[idx];
+  const navFromArr = toNavigationCfi(fromArr);
+  if (navFromArr) return navFromArr;
+
+  // 2. Через метод cfiFromLocation
   if (typeof locs.cfiFromLocation === "function") {
     try {
       const cfi = locs.cfiFromLocation(idx);
-      const target = toNavigationCfi(cfi);
-      if (target) return target;
+      const navCfi = toNavigationCfi(cfi);
+      if (navCfi) return navCfi;
     } catch {
       // Игнорируем
     }
   }
 
-  const fromArr = locs._locations?.[idx];
-  const fromArray = toNavigationCfi(fromArr);
-  if (fromArray) return fromArray;
-
+  // 3. Запасной вариант через процент
   try {
-    return toNavigationCfi(view.book.locations.cfiFromPercentage(
-      Math.max(0, Math.min(1, idx / Math.max(1, total - 1)))
-    ));
-  } catch { return null; }
+    const pct = total <= 1 ? 0 : idx / (total - 1);
+    const rawPctCfi = view.book.locations.cfiFromPercentage(Math.max(0, Math.min(1, pct)));
+    return toNavigationCfi(rawPctCfi);
+  } catch {
+    return null;
+  }
 }
 
 export function getCfiFromPageNumber(view: EpubView, page: number): string | null {
@@ -227,20 +237,23 @@ export function resolveInitialCfiBeforeRender(
     return { cfi: localCfi, savedAt: localTimeStr };
   }
 
+  if (!localCfi) {
+    return { cfi: yamlCfi, savedAt: yamlTimeStr || localTimeStr };
+  }
+
   const yamlMs = yamlTimeStr ? Date.parse(yamlTimeStr) : NaN;
   const localMs = localTimeStr ? Date.parse(localTimeStr) : NaN;
 
-  if (localCfi && Number.isFinite(yamlMs) && Number.isFinite(localMs)) {
+  if (Number.isFinite(yamlMs) && Number.isFinite(localMs)) {
     if (yamlMs > localMs) {
+      view.plugin.setLocalBookProgress(file.path, yamlCfi, yamlTimeStr!);
       return { cfi: yamlCfi, savedAt: yamlTimeStr };
     }
     return { cfi: localCfi, savedAt: localTimeStr };
   }
 
-  if (localCfi && Number.isFinite(localMs) && !Number.isFinite(yamlMs)) {
-    return { cfi: localCfi, savedAt: localTimeStr };
-  }
-  return { cfi: yamlCfi, savedAt: yamlTimeStr || localTimeStr };
+  // Если локальная позиция есть, всегда отдаём приоритет ей, чтобы старый YAML не сбрасывал чтение назад
+  return { cfi: localCfi, savedAt: localTimeStr || yamlTimeStr };
 }
 
 export async function tryLoadCachedLocations(
@@ -254,9 +267,6 @@ export async function tryLoadCachedLocations(
   if (currentLoadId !== view.loadId || !view.book || !cachedJson || view.isClosing) return false;
 
   try {
-    const parsed: unknown = JSON.parse(cachedJson);
-    if (!Array.isArray(parsed) || !parsed.length ||
-        !(parsed as unknown[]).every(cfi => toNavigationCfi(cfi) !== null)) return false;
     view.book.locations.load(cachedJson);
     return view.book.locations.length() > 0;
   } catch {
@@ -289,21 +299,21 @@ export async function generateLocationsInBackground(
 
     const rendExt = view.rendition as unknown as EpubRenditionExtended;
     const cur = rendExt.currentLocation?.();
-    if (!view.navigationInFlight && cur?.start?.cfi) {
-      captureChapterMetricsFromLoc(view, cur);
-      if (!view.stableCfi || view.userHasNavigated) view.stableCfi = cur.start.cfi;
+    const curCfi = toNavigationCfi(cur?.start?.cfi);
+    if (!view.navigationInFlight && curCfi) {
+      if (cur) captureChapterMetricsFromLoc(view, cur);
+      if (!view.stableCfi) view.stableCfi = curCfi;
       view.updateProgressLabels(view.stableCfi);
     }
 
     await reconcilePositionWithBookNote(view, file, currentLoadId);
-    if (currentLoadId !== view.loadId) return;
+    if (currentLoadId !== view.loadId || view.isClosing) return;
 
     view.finishInitialPositionRestore();
   } catch {
     if (currentLoadId === view.loadId && !view.isClosing) {
       view.isGeneratingLocations = false;
       view.finishInitialPositionRestore();
-      new Notice("Не удалось построить номера страниц. Позиция чтения продолжит сохраняться; переоткрой книгу для повторной попытки.");
     }
   }
 }
@@ -313,7 +323,7 @@ export async function reconcilePositionWithBookNote(
   file: TFile,
   currentLoadId: number
 ) {
-  if (view.ExplicitCfiJumpPending || view.userHasNavigated || view.progressPersistenceBlocked || view.isClosing) return;
+  if (view.ExplicitCfiJumpPending || view.userHasNavigated || view.isClosing) return;
   if (!view.linkedBookNote || !view.book || !view.rendition) return;
   if (!view.totalPagesNum || view.totalPagesNum <= 0) return;
 
@@ -332,8 +342,8 @@ export async function reconcilePositionWithBookNote(
     rawYamlRead !== undefined && rawYamlRead !== null && String(rawYamlRead).trim() !== "";
   const parsedYamlPage = hasYamlRead ? Math.round(Number(rawYamlRead)) : NaN;
   const yamlPage =
-    Number.isFinite(parsedYamlPage) && parsedYamlPage > 0 && parsedYamlPage <= view.totalPagesNum
-      ? parsedYamlPage
+    Number.isFinite(parsedYamlPage) && parsedYamlPage > 0
+      ? Math.max(1, Math.min(view.totalPagesNum, parsedYamlPage))
       : null;
 
   const localTimeStr =
@@ -344,49 +354,68 @@ export async function reconcilePositionWithBookNote(
   const localMs = localTimeStr ? Date.parse(localTimeStr) : NaN;
   const hasBothTimes = Number.isFinite(yamlMs) && Number.isFinite(localMs);
 
+  const localPage = view.currentPageNum ?? 1;
+
+  // Если пользователь вручную поменял поле «прочитано» в заметке книги (и оно отличается от страницы yamlCfi),
+  // переходим на указанную страницу. Иначе берём точный CFI.
   const pickTargetCfiFromYaml = (): string | null => {
-    // The CFI anchor takes priority over potentially renumbered page labels.
-    if (yamlCfi) return yamlCfi;
+    if (yamlCfi) {
+      if (yamlPage !== null) {
+        const cfiIdx = Number(view.book!.locations.locationFromCfi(yamlCfi));
+        if (Number.isFinite(cfiIdx) && cfiIdx >= 0) {
+          const cfiPage = Math.max(1, Math.min(view.totalPagesNum!, cfiIdx + 1));
+          if (Math.abs(cfiPage - yamlPage) >= 2) {
+            return getCfiFromPageNumberSafe(view, yamlPage);
+          }
+        }
+      }
+      return yamlCfi;
+    }
     if (yamlPage !== null) {
       return getCfiFromPageNumberSafe(view, yamlPage);
     }
     return null;
   };
 
-  const restore = async (target: string, savedAt: string) => {
-    const rendition = view.rendition;
-    if (!rendition || currentLoadId !== view.loadId || view.userHasNavigated) return;
+  const applyRestoredCfi = async (targetCfi: string, timeIso: string) => {
+    if (currentLoadId !== view.loadId || !view.rendition || view.userHasNavigated) return;
+    view.stableCfi = targetCfi;
+    view.lastLocalPositionSavedAt = timeIso;
+    view.plugin.setLocalBookProgress(file.path, targetCfi, timeIso);
     try {
-      await rendition.display(target);
-      if (currentLoadId !== view.loadId || rendition !== view.rendition || view.userHasNavigated) return;
-      view.stableCfi = target;
-      view.lastLocalPositionSavedAt = savedAt;
-      view.plugin.setLocalBookProgress(file.path, target, savedAt);
-      view.updateProgressLabels(target);
+      await view.rendition.display(targetCfi);
     } catch {
-      new Notice("Не удалось восстановить позицию из заметки. Текущий прогресс сохранён.");
+      // Игнорируем
     }
+    view.updateProgressLabels(targetCfi);
   };
 
   if (hasBothTimes) {
-    if (localMs >= yamlMs) return;
-    if (yamlMs > localMs) {
-      const targetCfi = pickTargetCfiFromYaml();
-      if (targetCfi && targetCfi !== view.stableCfi && currentLoadId === view.loadId) {
-        await restore(targetCfi, yamlTimeStr!);
-      }
+    if (localMs >= yamlMs) {
+      // Локальная позиция в плагине свежее или равна YAML — ничего не откатываем!
       return;
+    }
+    const targetCfi = pickTargetCfiFromYaml();
+    if (targetCfi && targetCfi !== view.stableCfi) {
+      await applyRestoredCfi(targetCfi, yamlTimeStr!);
     }
     return;
   }
 
-  // With no comparable timestamps, never replace a valid CFI with a page label.
-  if (toNavigationCfi(view.stableCfi)) return;
-  if (yamlPage !== null || yamlCfi) {
+  // Если локальной позиции ещё вообще не было, восстанавливаем из YAML
+  if (!view.stableCfi && (yamlCfi || yamlPage !== null)) {
     const targetCfi = pickTargetCfiFromYaml();
-    if (targetCfi && currentLoadId === view.loadId) {
-      const syncedTime = yamlTimeStr || new Date().toISOString();
-      await restore(targetCfi, syncedTime);
+    if (targetCfi) {
+      await applyRestoredCfi(targetCfi, yamlTimeStr || new Date().toISOString());
+    }
+    return;
+  }
+
+  // Если в YAML нет метки времени (например, изменили «прочитано» руками в дашборде) и нет yamlCfi
+  if (!yamlCfi && yamlPage !== null && yamlPage !== localPage) {
+    const targetCfi = getCfiFromPageNumberSafe(view, yamlPage);
+    if (targetCfi) {
+      await applyRestoredCfi(targetCfi, new Date().toISOString());
     }
   }
 }
@@ -396,7 +425,7 @@ export async function flushBookYamlProgress(view: EpubView) {
     window.clearTimeout(view.yamlSyncTimer);
     view.yamlSyncTimer = null;
   }
-  if (view.ExplicitCfiJumpPending || view.isResizing || view.progressPersistenceBlocked) return;
+  if (view.navHistory.length > 0) return;
 
   accrueActiveReadingTime(view, Date.now());
   const addedReadingMinutes = Math.floor(view.unsavedReadingSeconds / 60);
@@ -406,17 +435,24 @@ export async function flushBookYamlProgress(view: EpubView) {
   if (!view.linkedBookNote || !file) return;
   if (view.linkedBookNote.linkedEpubPath !== file.path) return;
 
+  const cfiToSync = toNavigationCfi(view.stableCfi);
+  if (!cfiToSync) return;
+
+  // Перед записью в YAML обязательно пересчитываем актуальный номер страницы из stableCfi,
+  // чтобы в заметке книги никогда не оставалась старая страница (например, 96).
+  if (view.book && view.book.locations.length() > 0) {
+    view.updateProgressLabels(cfiToSync);
+  }
+
   const noteFile = view.linkedBookNote.file;
   const pageNum = view.currentPageNum;
   const totalNum = view.totalPagesNum;
   const pctNum = view.currentProgressPct ?? view.approxProgressPct;
-  const cfiToSync = view.stableCfi;
   const posTimeIso =
     view.lastLocalPositionSavedAt ||
     view.plugin.settings.progressUpdatedAt?.[file.path] ||
     new Date().toISOString();
 
-  if (!cfiToSync) return;
   view.pendingYamlSync = false;
 
   const todayISO = getTodayISO();
