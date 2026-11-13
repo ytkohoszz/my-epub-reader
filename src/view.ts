@@ -457,8 +457,9 @@ info!: HTMLElement;
   isFullscreen = false;
   lastGestureTime = 0;
 
-  private workspaceEventsRegistered = false;
+private workspaceEventsRegistered = false;
   private selectionTimers = new Set<number>();
+  private mobileSelectionPollTimer: number | null = null;
 
   turnDurationsMs: number[] = [];
   lastTransitionTimestamp = 0;
@@ -548,7 +549,7 @@ info!: HTMLElement;
     this.lastReadingTickAt = now;
   }
 
-  private startReadingTimer() {
+private startReadingTimer() {
     if (this.readingTickTimer !== null) window.clearInterval(this.readingTickTimer);
     const now = Date.now();
     this.lastActivityAt = now;
@@ -559,6 +560,39 @@ info!: HTMLElement;
         this.requestYamlProgressSync();
       }
     }, READING_TICK_INTERVAL_MS);
+
+    if (Platform.isMobile) {
+      if (this.mobileSelectionPollTimer !== null) {
+        window.clearInterval(this.mobileSelectionPollTimer);
+      }
+      this.mobileSelectionPollTimer = window.setInterval(() => {
+        if (this.isClosing || document.querySelector(".modal-container")) return;
+        this.pollMobileIframeSelection();
+      }, 250);
+    }
+  }
+
+  private pollMobileIframeSelection() {
+    if (!this.boxEl) return;
+    try {
+      const iframes = Array.from(this.boxEl.querySelectorAll("iframe"));
+      for (const frame of iframes) {
+        const win = frame.contentWindow;
+        const doc = frame.contentDocument;
+        const sel = win?.getSelection?.() || doc?.getSelection?.();
+        const raw = sel?.toString() || "";
+        if (raw.trim().length > 0) {
+          syncSelectionFromAllIframes(this);
+          this.showSelectionFloatingBar(undefined, sel);
+          return;
+        }
+      }
+      if (this.capturedWord || this.capturedQuote) {
+        this.clearCapturedSelection();
+      }
+    } catch {
+      // Игнорируем
+    }
   }
 
   scheduleSelectionTimer(fn: () => void, ms: number): number {
@@ -1802,9 +1836,13 @@ this.infoTextEl?.setText(`${bmMark}${page}/${total} · ${pct}%${chapterLeftSuffi
     this.isGeneratingLocations = false;
     this.navHistory = [];
     this.plugin.syncGlobalBodyClasses();
-    if (this.readingTickTimer !== null) {
+if (this.readingTickTimer !== null) {
       window.clearInterval(this.readingTickTimer);
       this.readingTickTimer = null;
+    }
+    if (this.mobileSelectionPollTimer !== null) {
+      window.clearInterval(this.mobileSelectionPollTimer);
+      this.mobileSelectionPollTimer = null;
     }
     if (this.resizeTimer) {
       window.clearTimeout(this.resizeTimer);

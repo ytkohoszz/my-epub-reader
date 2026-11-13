@@ -1,6 +1,6 @@
 {
   "name": "my-epub-reader",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "Читалка EPUB с номером страницы и процентом",
   "main": "main.js",
   "scripts": {

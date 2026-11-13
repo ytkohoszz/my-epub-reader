@@ -562,8 +562,9 @@ body.my-epub-fullscreen .my-epub-wrap {
   padding-bottom: calc(3.55rem + env(safe-area-inset-bottom, 0px) * 0.45) !important;
 }
 
+/* На iPhone с чёлкой (iPhone 13 и др.) опускаем текст ровно под безопасную зону статус-бара + 6px */
 .is-phone body.my-epub-fullscreen .my-epub-wrap {
-  padding-top: 0 !important;
+  padding-top: calc(env(safe-area-inset-top, 44px) + 6px) !important;
   padding-bottom: calc(3.35rem + env(safe-area-inset-bottom, 0px) * 0.45) !important;
 }
 
