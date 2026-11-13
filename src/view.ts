@@ -697,26 +697,26 @@ private startReadingTimer() {
     };
 this.updateBackPillState();
 
-    this.selFloatBarEl = root.createDiv("my-epub-sel-popover");
+this.selFloatBarEl = root.createDiv("my-epub-sel-popover");
     const selTrBtn = this.selFloatBarEl.createEl("button", {
       cls: "my-epub-sel-btn",
-      text: "🌐 Перевод",
-      attr: { type: "button", "aria-label": "Быстрый перевод" },
+      text: "🌐",
+      attr: { type: "button", title: "Быстрый перевод", "aria-label": "Быстрый перевод" },
     });
     const selWordBtn = this.selFloatBarEl.createEl("button", {
       cls: "my-epub-sel-btn my-epub-sel-btn-accent",
-      text: "+ Слово",
-      attr: { type: "button", "aria-label": "Добавить слово в словарь" },
+      text: "＋",
+      attr: { type: "button", title: "Добавить слово в словарь", "aria-label": "Добавить слово в словарь" },
     });
     const selQuoteBtn = this.selFloatBarEl.createEl("button", {
       cls: "my-epub-sel-btn",
-      text: "💬 Цитата",
-      attr: { type: "button", "aria-label": "Добавить цитату" },
+      text: "💬",
+      attr: { type: "button", title: "Добавить цитату", "aria-label": "Добавить цитату" },
     });
     const selSpeakBtn = this.selFloatBarEl.createEl("button", {
       cls: "my-epub-sel-btn",
       text: "🔊",
-      attr: { type: "button", "aria-label": "Озвучить выделенное" },
+      attr: { type: "button", title: "Озвучить выделенное", "aria-label": "Озвучить выделенное" },
     });
 
     bindActionButton(this, selTrBtn, () => this.handleQuickTranslateClick());

@@ -134,17 +134,19 @@ body:not(.is-mobile) .my-epub-box {
 
 .my-epub-sel-popover.is-mobile-dock .my-epub-sel-btn {
   min-height: 38px !important;
-  padding: 0 0.68rem !important;
-  font-size: 0.85rem !important;
+  min-width: 42px !important;
+  padding: 0 0.62rem !important;
+  font-size: 1rem !important;
 }
 
 .my-epub-sel-btn {
-  min-height: 32px !important;
-  min-width: 32px !important;
-  padding: 0 0.58rem !important;
-  font-size: 0.8rem !important;
-  font-weight: 600 !important;
-  border-radius: 8px !important;
+  min-height: 34px !important;
+  min-width: 36px !important;
+  padding: 0 0.52rem !important;
+  font-size: 0.92rem !important;
+  font-weight: 700 !important;
+  line-height: 1 !important;
+  border-radius: 9px !important;
   border: 1px solid transparent !important;
   box-shadow: none !important;
   background: var(--background-primary) !important;
@@ -387,8 +389,26 @@ body:not(.is-mobile) .my-epub:not(.my-epub-bar-is-top) .my-epub-bar {
   background: #8b4513;
 }
 
-.my-epub-info:hover {
+.my-epub-info {
+  transition: background-color 0.14s ease, color 0.14s ease;
+}
+
+.my-epub-info:hover,
+.my-epub-info:active {
   background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.my-epub.my-epub-is-sepia .my-epub-info:hover,
+.my-epub.my-epub-is-sepia .my-epub-info:active {
+  background: #dfd3b8;
+  color: #3b2f2f;
+}
+
+.my-epub.my-epub-is-night .my-epub-info:hover,
+.my-epub.my-epub-is-night .my-epub-info:active {
+  background: #23262d;
+  color: #e2e5ea;
 }
 
 @media (max-width: 640px) {
