@@ -63,6 +63,8 @@ import {
   setupViewGesturesAndSelection,
   syncSelectionFromAllIframes,
 } from "./gestures";
+import { speakEnglishText } from "./modals";
+import type { EpubContentsExtended } from "./settings";
 import type MyEpubPlugin from "./main";
 
 // Модальное окно настроек вида и чтения вместо системного Menu
@@ -141,8 +143,20 @@ class AppearanceModal extends Modal {
 
     const topActions = contentEl.createDiv("my-epub-appear-actions");
 
+if (this.view.linkedBookNote) {
+      const openNoteBtn = topActions.createEl("button", {
+        cls: "my-epub-appear-action-btn",
+        text: `📄 Открыть заметку: ${this.view.linkedBookNote.title}`,
+        attr: { type: "button" },
+      });
+      openNoteBtn.onclick = () => {
+        this.safeClose();
+        void this.view.openLinkedBookNote();
+      };
+    }
+
     const linkedLabel = this.view.linkedBookNote
-      ? `📖 Книга: ${this.view.linkedBookNote.title} (сменить…)`
+      ? `📖 Сменить привязку книги (${this.view.linkedBookNote.title})…`
       : "📖 Привязать заметку книги…";
     const linkBookBtn = topActions.createEl("button", {
       cls: "my-epub-appear-action-btn",
@@ -327,7 +341,7 @@ class AppearanceModal extends Modal {
       };
     }
 
-    const hyphBtn = alignRow.createEl("button", {
+const hyphBtn = alignRow.createEl("button", {
       cls: "my-epub-appear-chip" + (curHyphens ? " is-active" : ""),
       text: curHyphens ? "✓ Переносы слов" : "Переносы слов",
       attr: { type: "button" },
@@ -339,6 +353,21 @@ class AppearanceModal extends Modal {
       this.view.applyStylesAndRestore();
       this.view.plugin.requestSaveSettings();
       new Notice(s.hyphens ? "Переносы слов включены" : "Переносы слов выключены");
+      this.render();
+    };
+
+    const curAutoSpeak = Boolean(s.autoSpeakOnTranslate);
+    const autoSpeakBtn = alignRow.createEl("button", {
+      cls: "my-epub-appear-chip" + (curAutoSpeak ? " is-active" : ""),
+      text: curAutoSpeak ? "🔊 Авто-озвучка: вкл" : "🔇 Авто-озвучка: выкл",
+      attr: { type: "button" },
+    });
+    autoSpeakBtn.onclick = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      s.autoSpeakOnTranslate = !curAutoSpeak;
+      this.view.plugin.requestSaveSettings();
+      new Notice(s.autoSpeakOnTranslate ? "Авто-озвучка при переводе включена" : "Авто-озвучка выключена");
       this.render();
     };
 
@@ -413,17 +442,13 @@ export class EpubView extends FileView {
   barEl!: HTMLElement;
   fsBarEl!: HTMLElement;
   fsInfoEl!: HTMLElement;
-  backPillEl!: HTMLElement;
+backPillEl!: HTMLElement;
   backPillTextEl!: HTMLElement;
-  info!: HTMLElement;
-  themeBtn!: HTMLButtonElement;
+  selFloatBarEl!: HTMLElement;
+info!: HTMLElement;
+  infoTextEl!: HTMLElement;
+  progressFillEl!: HTMLElement;
   fsBtn!: HTMLButtonElement;
-  quickTrBtn!: HTMLButtonElement;
-  addWordBtn!: HTMLButtonElement;
-  addQuoteBtn!: HTMLButtonElement;
-  fsQuickTrBtn!: HTMLButtonElement;
-  fsAddWordBtn!: HTMLButtonElement;
-  fsAddQuoteBtn!: HTMLButtonElement;
   resizeObserver: ResizeObserver | null = null;
   resizeTimer: number | null = null;
   animTimer: number | null = null;
@@ -636,33 +661,58 @@ export class EpubView extends FileView {
       this.updateBackPillState();
       this.requestYamlProgressSync();
     };
-    this.updateBackPillState();
+this.updateBackPillState();
 
-    this.fsBarEl = root.createDiv("my-epub-fs-bar");
+    this.selFloatBarEl = root.createDiv("my-epub-sel-popover");
+    const selTrBtn = this.selFloatBarEl.createEl("button", {
+      cls: "my-epub-sel-btn",
+      text: "🌐 Перевод",
+      attr: { type: "button", "aria-label": "Быстрый перевод" },
+    });
+    const selWordBtn = this.selFloatBarEl.createEl("button", {
+      cls: "my-epub-sel-btn my-epub-sel-btn-accent",
+      text: "+ Слово",
+      attr: { type: "button", "aria-label": "Добавить слово в словарь" },
+    });
+    const selQuoteBtn = this.selFloatBarEl.createEl("button", {
+      cls: "my-epub-sel-btn",
+      text: "💬 Цитата",
+      attr: { type: "button", "aria-label": "Добавить цитату" },
+    });
+    const selSpeakBtn = this.selFloatBarEl.createEl("button", {
+      cls: "my-epub-sel-btn",
+      text: "🔊",
+      attr: { type: "button", "aria-label": "Озвучить выделенное" },
+    });
+
+    bindActionButton(this, selTrBtn, () => this.handleQuickTranslateClick());
+    bindActionButton(this, selWordBtn, () => this.handleAddWordClick());
+    bindActionButton(this, selQuoteBtn, () => this.handleAddQuoteClick());
+    bindActionButton(this, selSpeakBtn, () => {
+      const text = this.capturedWord || this.capturedQuote;
+      if (text) speakEnglishText(text);
+    });
+
+this.fsBarEl = root.createDiv("my-epub-fs-bar");
     const fsPrev = this.fsBarEl.createEl("button", {
       cls: "my-epub-fs-btn",
       text: "◀",
       attr: { "aria-label": "Предыдущая страница" },
+    });
+    const fsTocBtn = this.fsBarEl.createEl("button", {
+      cls: "my-epub-fs-btn",
+      text: "📑",
+      attr: { "aria-label": "Оглавление, закладки, слова и поиск" },
     });
     this.fsInfoEl = this.fsBarEl.createSpan({
       cls: "my-epub-fs-info",
       text: "… · ⛶",
       attr: { "aria-label": "Выйти из полноэкранного режима" },
     });
-    this.fsQuickTrBtn = this.fsBarEl.createEl("button", {
-      cls: "my-epub-fs-btn my-epub-word-btn",
-      text: "🌐",
-      attr: { "aria-label": "Быстрый перевод" },
-    });
-    this.fsAddWordBtn = this.fsBarEl.createEl("button", {
-      cls: "my-epub-fs-btn my-epub-word-btn",
-      text: "+ Слово",
-      attr: { "aria-label": "Добавить слово в словарь" },
-    });
-    this.fsAddQuoteBtn = this.fsBarEl.createEl("button", {
-      cls: "my-epub-fs-btn my-epub-word-btn",
-      text: "💬",
-      attr: { "aria-label": "Добавить цитату" },
+    const fsFontBtn = this.fsBarEl.createEl("button", {
+      cls: "my-epub-fs-btn",
+      text: "🔤",
+      attr: { "aria-label": "Вид и настройки чтения" },
     });
     const fsNext = this.fsBarEl.createEl("button", {
       cls: "my-epub-fs-btn",
@@ -672,10 +722,9 @@ export class EpubView extends FileView {
 
     fsPrev.onclick = (e) => { e.stopPropagation(); this.turnPage("prev"); };
     fsNext.onclick = (e) => { e.stopPropagation(); this.turnPage("next"); };
+    fsTocBtn.onclick = (e) => { e.stopPropagation(); void this.openToc(); };
+    fsFontBtn.onclick = (e) => { e.stopPropagation(); this.openTypographyMenu(); };
     this.fsInfoEl.onclick = (e) => { e.stopPropagation(); this.toggleFullscreen(false); };
-    bindActionButton(this, this.fsQuickTrBtn, () => this.handleQuickTranslateClick());
-    bindActionButton(this, this.fsAddWordBtn, () => this.handleAddWordClick());
-    bindActionButton(this, this.fsAddQuoteBtn, () => this.handleAddQuoteClick());
 
     this.barEl = root.createDiv("my-epub-bar");
     this.applyBarPosition();
@@ -691,52 +740,25 @@ export class EpubView extends FileView {
       text: "📑",
       attr: { "aria-label": "Оглавление, закладки, слова и поиск" },
     });
-    const smaller = leftGroup.createEl("button", {
-      cls: "my-epub-btn",
-      text: "A−",
-      attr: { "aria-label": "Уменьшить размер шрифта" },
-    });
 
     this.info = this.barEl.createDiv({
       cls: "my-epub-info",
-      text: "загрузка…",
       attr: { title: "Нажми для быстрого перехода к странице" },
     });
+    this.infoTextEl = this.info.createDiv({
+      cls: "my-epub-info-text",
+      text: "загрузка…",
+    });
+    const progressTrack = this.info.createDiv("my-epub-progress-track");
+    this.progressFillEl = progressTrack.createDiv("my-epub-progress-fill");
     this.info.onclick = () => this.openJumpModal();
 
     const rightGroup = this.barEl.createDiv("my-epub-group");
-    this.quickTrBtn = rightGroup.createEl("button", {
-      cls: "my-epub-btn my-epub-word-btn",
-      text: "🌐",
-      attr: { "aria-label": "Быстрый перевод без записи в словарь" },
-    });
-    this.addWordBtn = rightGroup.createEl("button", {
-      cls: "my-epub-btn my-epub-word-btn",
-      text: "+ Слово",
-      attr: { "aria-label": "Добавить выделенное слово в словарь" },
-    });
-    this.addQuoteBtn = rightGroup.createEl("button", {
-      cls: "my-epub-btn my-epub-word-btn",
-      text: "💬",
-      attr: { "aria-label": "Добавить выделенную цитату" },
-    });
-    bindActionButton(this, this.quickTrBtn, () => this.handleQuickTranslateClick());
-    bindActionButton(this, this.addWordBtn, () => this.handleAddWordClick());
-    bindActionButton(this, this.addQuoteBtn, () => this.handleAddQuoteClick());
-    this.updateSelectionButtonsState();
-
-    const bigger = rightGroup.createEl("button", {
-      cls: "my-epub-btn",
-      text: "A+",
-      attr: { "aria-label": "Увеличить размер шрифта" },
-    });
     const fontBtn = rightGroup.createEl("button", {
       cls: "my-epub-btn",
       text: "🔤",
-      attr: { "aria-label": "Вид, шрифт, поля, выравнивание и привязка книги" },
+      attr: { "aria-label": "Вид, тема, шрифт, поля и привязка книги" },
     });
-    this.themeBtn = rightGroup.createEl("button", { cls: "my-epub-btn" });
-    this.updateThemeBtnText();
     this.fsBtn = rightGroup.createEl("button", {
       cls: "my-epub-btn",
       text: "⛶",
@@ -768,11 +790,8 @@ export class EpubView extends FileView {
       this.applyStyles();
       setupViewGesturesAndSelection(this);
 
-      prev.onclick = () => this.turnPage("prev");
+prev.onclick = () => this.turnPage("prev");
       next.onclick = () => this.turnPage("next");
-      smaller.onclick = () => this.setFont(-10);
-      bigger.onclick = () => this.setFont(10);
-      this.themeBtn.onclick = () => this.toggleThemeMode();
       this.fsBtn.onclick = () => this.toggleFullscreen();
       tocBtn.onclick = () => this.openToc();
       fontBtn.onclick = () => this.openTypographyMenu();
@@ -902,11 +921,13 @@ export class EpubView extends FileView {
     );
     this.bookWords = words;
     this.bookQuotes = quotes;
-    applyHighlightsToRendition(
+applyHighlightsToRendition(
       this.rendition,
       this.appliedHighlightCfis,
       this.bookWords,
-      this.bookQuotes
+      this.bookQuotes,
+      this.plugin.settings.themeMode ?? "auto",
+      this.contentEl
     );
   }
 
@@ -1044,10 +1065,80 @@ export class EpubView extends FileView {
     }
   }
 
+showSelectionFloatingBar(contentsObj?: EpubContentsExtended, selObj?: Selection | null) {
+    if (!this.selFloatBarEl || !this.contentEl) return;
+    if (!this.capturedWord && !this.capturedQuote) {
+      this.hideSelectionFloatingBar();
+      return;
+    }
+
+    try {
+      let activeSel = selObj ?? null;
+      let doc: Document | undefined = contentsObj?.document;
+
+      if (!activeSel || activeSel.rangeCount === 0) {
+        const iframes = this.boxEl ? Array.from(this.boxEl.querySelectorAll("iframe")) : [];
+        for (const frame of iframes) {
+          const s = frame.contentWindow?.getSelection?.() || frame.contentDocument?.getSelection?.();
+          if (s && s.rangeCount > 0 && s.toString().trim().length > 0) {
+            activeSel = s;
+            doc = frame.contentDocument || undefined;
+            break;
+          }
+        }
+      }
+
+      if (!activeSel || activeSel.rangeCount === 0) return;
+
+      const range = activeSel.getRangeAt(0);
+      const rangeRect = range.getBoundingClientRect();
+      if (rangeRect.width === 0 && rangeRect.height === 0) return;
+
+      const frameEl = (doc?.defaultView?.frameElement as HTMLElement | null) || null;
+      const frameRect = frameEl
+        ? frameEl.getBoundingClientRect()
+        : this.boxEl.getBoundingClientRect();
+      const rootRect = this.contentEl.getBoundingClientRect();
+
+      const selLeft = frameRect.left - rootRect.left + rangeRect.left;
+      const selTop = frameRect.top - rootRect.top + rangeRect.top;
+      const selBottom = frameRect.top - rootRect.top + rangeRect.bottom;
+      const selCenterX = selLeft + rangeRect.width / 2;
+
+      this.selFloatBarEl.addClass("is-visible");
+      const popWidth = this.selFloatBarEl.offsetWidth || 256;
+      const popHeight = this.selFloatBarEl.offsetHeight || 40;
+
+      const minLeft = 8;
+      const maxLeft = Math.max(minLeft, rootRect.width - popWidth - 8);
+      const clampedLeft = Math.max(minLeft, Math.min(maxLeft, selCenterX - popWidth / 2));
+
+      // На тач-устройствах iOS/iPadOS рисует системное меню сверху от выделения — ставим нашу капсулу снизу.
+      // На десктопе ставим сверху (с фоллбэком вниз, если выделение у верхнего края).
+      const preferBelow = Platform.isMobile || selTop < popHeight + 24;
+      let targetTop = preferBelow ? selBottom + 14 : selTop - popHeight - 10;
+
+      const maxTop = Math.max(8, rootRect.height - popHeight - 68);
+      if (targetTop > maxTop) {
+        targetTop = Math.max(8, selTop - popHeight - 10);
+      }
+
+      this.selFloatBarEl.style.left = `${Math.round(clampedLeft)}px`;
+      this.selFloatBarEl.style.top = `${Math.round(targetTop)}px`;
+    } catch {
+      // Игнорируем ошибку позиционирования
+    }
+  }
+
+  hideSelectionFloatingBar() {
+    this.selFloatBarEl?.removeClass("is-visible");
+  }
+
   clearCapturedSelection() {
     this.capturedWord = "";
     this.capturedQuote = "";
     this.capturedCfi = null;
+    this.hideSelectionFloatingBar();
     this.updateSelectionButtonsState();
     this.prepareMainWindowFocusBeforeModal();
   }
@@ -1130,27 +1221,8 @@ export class EpubView extends FileView {
     await this.yamlWriteQueue;
   }
 
-  updateSelectionButtonsState() {
-    const hasWord = this.capturedWord.length > 0;
-    const hasQuote = this.capturedQuote.length > 0;
-    const shortMain =
-      this.capturedWord.length > 10 ? this.capturedWord.slice(0, 9) + "…" : this.capturedWord;
-    const shortFs =
-      this.capturedWord.length > 7 ? this.capturedWord.slice(0, 6) + "…" : this.capturedWord;
-
-    if (this.quickTrBtn) this.quickTrBtn.toggleClass("is-ready", hasWord);
-    if (this.fsQuickTrBtn) this.fsQuickTrBtn.toggleClass("is-ready", hasWord);
-
-    if (this.addWordBtn) {
-      this.addWordBtn.toggleClass("is-ready", hasWord);
-      this.addWordBtn.setText(hasWord ? `+ «${shortMain}»` : "+ Слово");
-    }
-    if (this.fsAddWordBtn) {
-      this.fsAddWordBtn.toggleClass("is-ready", hasWord);
-      this.fsAddWordBtn.setText(hasWord ? `+ «${shortFs}»` : "+ Слово");
-    }
-    if (this.addQuoteBtn) this.addQuoteBtn.toggleClass("is-ready", hasQuote);
-    if (this.fsAddQuoteBtn) this.fsAddQuoteBtn.toggleClass("is-ready", hasQuote);
+updateSelectionButtonsState() {
+    // Действия с выделением перенесены в контекстный поповер над выделенным текстом
   }
 
   openAddWordModalWithRefresh(
@@ -1183,6 +1255,16 @@ export class EpubView extends FileView {
     modal.open();
   }
 
+async openLinkedBookNote() {
+    if (!this.linkedBookNote) {
+      this.openBookLinkModal();
+      return;
+    }
+    await this.flushYamlProgress();
+    const leaf = this.app.workspace.getLeaf(false);
+    await leaf.openFile(this.linkedBookNote.file);
+  }
+
   handleQuickTranslateClick() {
     if (!this.file) return;
     syncSelectionFromAllIframes(this);
@@ -1191,11 +1273,16 @@ export class EpubView extends FileView {
     const cfiToSave = this.capturedCfi || this.stableCfi;
     this.clearCapturedSelection();
 
-    new QuickTranslateModal(this.app, textToLookup, (chosenWord) => {
-      this.capturedWord = chosenWord;
-      this.capturedCfi = cfiToSave;
-      this.openWordFlowWithExplicitWord(chosenWord, cfiToSave);
-    }).open();
+    new QuickTranslateModal(
+      this.app,
+      textToLookup,
+      (chosenWord) => {
+        this.capturedWord = chosenWord;
+        this.capturedCfi = cfiToSave;
+        this.openWordFlowWithExplicitWord(chosenWord, cfiToSave);
+      },
+      Boolean(this.plugin.settings.autoSpeakOnTranslate)
+    ).open();
   }
 
   openWordFlowWithExplicitWord(wordToSave: string, cfiToSave: string | null) {
@@ -1258,14 +1345,14 @@ export class EpubView extends FileView {
     });
   }
 
-  showError(fileName: string, details: string) {
+showError(fileName: string, details: string) {
     if (!this.boxEl) return;
     this.boxEl.empty();
     const errBox = this.boxEl.createDiv("my-epub-error");
     errBox.createEl("h3", { text: "⚠️ Не удалось открыть книгу" });
     errBox.createEl("p", { text: `Файл: ${fileName}` });
     errBox.createEl("p", { cls: "my-epub-error-details", text: details });
-    this.info?.setText("ошибка файла");
+    this.infoTextEl?.setText("ошибка файла");
   }
 
   applyDesktopWidth(withResize = true) {
@@ -1457,18 +1544,8 @@ export class EpubView extends FileView {
     this.resizeObserver.observe(this.boxEl);
   }
 
-  updateThemeBtnText() {
-    if (!this.themeBtn) return;
-    const mode = this.plugin.settings.themeMode ?? "auto";
-    const icon = mode === "sepia" ? "📜" : mode === "night" ? "🌙" : "🌗";
-    const label =
-      mode === "sepia"
-        ? "Режим: Сепия (нажми для режима Ночь)"
-        : mode === "night"
-          ? "Режим: Ночь (нажми для Авто)"
-          : "Режим: Авто (нажми для Сепии)";
-    this.themeBtn.setText(icon);
-    this.themeBtn.setAttr("aria-label", label);
+updateThemeBtnText() {
+    // Тема переключается в окне настроек вида (🔤) и применяется через applyStyles()
   }
 
   toggleThemeMode() {
@@ -1610,12 +1687,14 @@ export class EpubView extends FileView {
       },
     });
 
-    if (this.bookWords.length > 0 || this.bookQuotes.length > 0) {
+if (this.bookWords.length > 0 || this.bookQuotes.length > 0) {
       applyHighlightsToRendition(
         this.rendition,
         this.appliedHighlightCfis,
         this.bookWords,
-        this.bookQuotes
+        this.bookQuotes,
+        mode,
+        this.contentEl
       );
     }
   }
@@ -1659,11 +1738,13 @@ export class EpubView extends FileView {
       this.currentProgressPct = pct;
       this.approxProgressPct = pct;
 
-      this.info.setText(`${bmMark}стр. ${page} / ${total} · ${pct}%${chapterLeftSuffix}`);
+this.infoTextEl?.setText(`${bmMark}${page}/${total} · ${pct}%${chapterLeftSuffix}`);
+      if (this.progressFillEl) this.progressFillEl.style.width = `${pct}%`;
       this.fsInfoEl?.setText(`${bmMark}${page}/${total} · ${pct}% ⛶`);
     } else {
       const fastPct = computeFastPercentage(this, cleanCfi);
-      this.info.setText(`${bmMark}~${fastPct}%${chapterLeftSuffix} · считаю стр.…`);
+      this.infoTextEl?.setText(`${bmMark}~${fastPct}%${chapterLeftSuffix}`);
+      if (this.progressFillEl) this.progressFillEl.style.width = `${fastPct}%`;
       this.fsInfoEl?.setText(`${bmMark}~${fastPct}% ⛶`);
     }
   }

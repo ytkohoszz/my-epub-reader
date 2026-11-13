@@ -1349,7 +1349,10 @@ export class AddWordModal extends Modal {
       }
     };
 
-    if (this.initialWord) {
+if (this.initialWord) {
+      if (this.plugin.settings.autoSpeakOnTranslate) {
+        speakEnglishText(this.initialWord);
+      }
       void doTranslate();
     } else {
       window.setTimeout(() => enInput.focus(), 40);

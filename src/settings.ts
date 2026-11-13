@@ -97,9 +97,10 @@ export interface Settings {
   desktopWidthPct?: number;
   locationsCache?: Record<string, LegacyLocationCacheEntry>;
   bookmarks?: Record<string, BookmarkItem[]>;
-  booksFolder?: string;
+booksFolder?: string;
   wordsFilePath?: string;
   quotesFilePath?: string;
+  autoSpeakOnTranslate?: boolean;
 }
 
 export const DEFAULTS: Settings = {
@@ -117,9 +118,10 @@ export const DEFAULTS: Settings = {
   spreadMode: "none",
   desktopWidthPct: 85,
   bookmarks: {},
-  booksFolder: "Знания/Книги",
+booksFolder: "Знания/Книги",
   wordsFilePath: "Words Cards",
   quotesFilePath: "Знания/Цитаты из книг.md",
+  autoSpeakOnTranslate: false,
 };
 
 export const FONT_MAP: Record<FontFamily, string> = {
@@ -153,7 +155,8 @@ export function migrateSettings(raw: unknown): Settings {
   if (s.pageAnimation !== "slide" && s.pageAnimation !== "fade" && s.pageAnimation !== "none") {
     s.pageAnimation = "slide";
   }
-  if (s.barPosition !== "bottom" && s.barPosition !== "top") s.barPosition = "bottom";
+if (s.barPosition !== "bottom" && s.barPosition !== "top") s.barPosition = "bottom";
+  if (typeof s.autoSpeakOnTranslate !== "boolean") s.autoSpeakOnTranslate = false;
   return s;
 }
 
@@ -265,7 +268,7 @@ export class EpubSettingTab extends PluginSettingTab {
           })
       );
 
-    new Setting(containerEl)
+new Setting(containerEl)
       .setName("Автоматические переносы слов")
       .setDesc("Включить CSS-переносы (hyphens: auto)")
       .addToggle((toggle) =>
@@ -275,6 +278,18 @@ export class EpubSettingTab extends PluginSettingTab {
             this.plugin.settings.hyphens = val;
             this.plugin.requestSaveSettings();
             this.plugin.refreshAllViews();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Авто-озвучка при переводе")
+      .setDesc("Автоматически произносить выделенное английское слово при открытии перевода или карточки слова")
+      .addToggle((toggle) =>
+        toggle
+          .setValue(Boolean(this.plugin.settings.autoSpeakOnTranslate))
+          .onChange((val) => {
+            this.plugin.settings.autoSpeakOnTranslate = val;
+            this.plugin.requestSaveSettings();
           })
       );
 

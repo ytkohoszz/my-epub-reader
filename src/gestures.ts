@@ -95,7 +95,8 @@ export function saveCapturedText(
     }
   }
 
-  view.updateSelectionButtonsState();
+view.updateSelectionButtonsState();
+  view.showSelectionFloatingBar(contentsObj, selObj);
 }
 
 export function attachInternalLinkInterceptor(view: EpubView, doc: Document) {
@@ -172,8 +173,12 @@ export function attachTouchHandlers(
     ).trim();
   };
 
-  const onTouchStart = (ev: Event) => {
+const onTouchStart = (ev: Event) => {
     const e = ev as TouchEvent;
+    if ((e.touches?.length ?? 0) > 1) {
+      active = false;
+      return;
+    }
     const touch = e.changedTouches?.[0] ?? e.touches?.[0];
     if (!touch) return;
     view.recordReadingActivity();
@@ -187,7 +192,6 @@ export function attachTouchHandlers(
     active = true;
     hadSelectionOnStart = getDocSelectionString().length > 0;
   };
-
   const onTouchMove = (ev: Event) => {
     if (!active) return;
 
@@ -251,23 +255,24 @@ export function attachTouchHandlers(
       return;
     }
 
-    if (
+if (
       e.type === "touchend" &&
       !isSwiping &&
-      dt < 350 &&
-      Math.abs(dx) < 15 &&
-      Math.abs(dy) < 15
+      dt >= 25 &&
+      dt < 260 &&
+      Math.abs(dx) < 12 &&
+      Math.abs(dy) < 12
     ) {
       const el = e.target as HTMLElement | null;
-      if (el?.closest && el.closest("a, button, .my-epub-fs-bar, .my-epub-back-pill")) {
+      if (el?.closest && el.closest("a, button, input, .my-epub-fs-bar, .my-epub-back-pill, .my-epub-hl-card")) {
         return;
       }
 
       view.lastGestureTime = now;
       const ratio = getRelativeTapRatio(view, target, endClientX);
-      if (ratio < 0.26) {
+      if (ratio < 0.24) {
         view.turnPage("prev");
-      } else if (ratio > 0.74) {
+      } else if (ratio > 0.76) {
         view.turnPage("next");
       } else {
         view.toggleFullscreen();
@@ -316,11 +321,13 @@ export function setupViewGesturesAndSelection(view: EpubView) {
     attachInternalLinkInterceptor(view, doc);
 
     const checkIframeSelection = () => {
-      try {
+try {
         const sel = win?.getSelection?.() || doc.getSelection?.();
         const raw = sel?.toString() || "";
         if (raw.trim().length > 0) {
           saveCapturedText(view, raw, undefined, contents, sel);
+        } else {
+          view.hideSelectionFloatingBar();
         }
       } catch {
         // Игнорируем
@@ -355,14 +362,35 @@ export function setupViewGesturesAndSelection(view: EpubView) {
       view.scheduleSelectionTimer(checkIframeSelection, 180);
     };
 
-    const onDocMouseUp = () => {
+const onDocMouseUp = () => {
       view.recordReadingActivity();
       view.scheduleSelectionTimer(checkIframeSelection, 20);
+    };
+
+    let lastWheelTurnAt = 0;
+    const onDocWheel = (ev: WheelEvent) => {
+      if (ev.ctrlKey || ev.metaKey) return;
+      if (document.querySelector(".modal-container")) return;
+
+      const absX = Math.abs(ev.deltaX);
+      const absY = Math.abs(ev.deltaY);
+      const dominant = absX > absY ? ev.deltaX : ev.deltaY;
+      if (Math.abs(dominant) < 18) return;
+
+      ev.preventDefault();
+      const now = Date.now();
+      if (now - lastWheelTurnAt < 320) return;
+      lastWheelTurnAt = now;
+
+      view.recordReadingActivity();
+      if (dominant > 0) view.turnPage("next");
+      else view.turnPage("prev");
     };
 
     doc.addEventListener("selectionchange", onThrottledSelectionChange);
     doc.addEventListener("touchend", onDocTouchEnd, { passive: true });
     doc.addEventListener("mouseup", onDocMouseUp);
+    doc.addEventListener("wheel", onDocWheel, { passive: false });
 
     view.cleanupListeners.push(() => {
       if (selThrottleTimer !== null) {
@@ -372,11 +400,36 @@ export function setupViewGesturesAndSelection(view: EpubView) {
       doc.removeEventListener("selectionchange", onThrottledSelectionChange);
       doc.removeEventListener("touchend", onDocTouchEnd);
       doc.removeEventListener("mouseup", onDocMouseUp);
+      doc.removeEventListener("wheel", onDocWheel);
     });
   });
 
   if (view.wrapEl) {
     attachTouchHandlers(view, view.wrapEl, false);
+
+    let lastWrapWheelAt = 0;
+    const onWrapWheel = (ev: WheelEvent) => {
+      if (ev.ctrlKey || ev.metaKey) return;
+      if (document.querySelector(".modal-container")) return;
+      const absX = Math.abs(ev.deltaX);
+      const absY = Math.abs(ev.deltaY);
+      const dominant = absX > absY ? ev.deltaX : ev.deltaY;
+      if (Math.abs(dominant) < 18) return;
+
+      ev.preventDefault();
+      const now = Date.now();
+      if (now - lastWrapWheelAt < 320) return;
+      lastWrapWheelAt = now;
+
+      view.recordReadingActivity();
+      if (dominant > 0) view.turnPage("next");
+      else view.turnPage("prev");
+    };
+
+    view.wrapEl.addEventListener("wheel", onWrapWheel, { passive: false });
+    view.cleanupListeners.push(() => {
+      view.wrapEl?.removeEventListener("wheel", onWrapWheel);
+    });
   }
 
   view.rendition.on("keyup", (e: KeyboardEvent) => {

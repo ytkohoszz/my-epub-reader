@@ -238,10 +238,14 @@ export async function loadBookAnnotationsFromVault(
   return { words: words.reverse(), quotes: quotes.reverse() };
 }
 
-function highlightStyles(fill: string, opacity: string): Record<string, string> {
-  const isNightView = document.querySelector(".view-content.my-epub.my-epub-is-night") !== null;
-  const isSepiaView = document.querySelector(".view-content.my-epub.my-epub-is-sepia") !== null;
-  const isDark = isNightView || (!isSepiaView && document.body.classList.contains("theme-dark"));
+function highlightStyles(
+  fill: string,
+  opacity: string,
+  themeMode: "auto" | "sepia" | "night" = "auto"
+): Record<string, string> {
+  const isDark =
+    themeMode === "night" ||
+    (themeMode === "auto" && document.body.classList.contains("theme-dark"));
   return {
     fill,
     "fill-opacity": isDark ? "0.38" : opacity,
@@ -271,11 +275,13 @@ function showHighlightPopoverCard(
     speakWord?: string;
     targetFilePath: string;
     lineNumber: number;
+    hostContainer?: HTMLElement | null;
   }
 ) {
   closeActiveHighlightPopover();
 
   const hostEl =
+    opts.hostContainer ||
     (document.querySelector(".view-content.my-epub") as HTMLElement | null) ||
     document.body;
 
@@ -395,7 +401,9 @@ export function applyHighlightsToRendition(
   rendition: Rendition | null,
   appliedCfis: Set<string>,
   words: BookWordEntry[],
-  quotes: BookQuoteEntry[]
+  quotes: BookQuoteEntry[],
+  themeMode: "auto" | "sepia" | "night" = "auto",
+  hostContainer?: HTMLElement | null
 ) {
   closeActiveHighlightPopover();
   if (!rendition || !rendition.annotations) return;
@@ -424,10 +432,11 @@ export function applyHighlightsToRendition(
             speakWord: w.word,
             targetFilePath: activeWordsFilePath,
             lineNumber: w.lineNumber,
+            hostContainer,
           });
         },
         "my-epub-hl-word",
-        highlightStyles("#599ed6", "0.28")
+        highlightStyles("#599ed6", "0.28", themeMode)
       );
       appliedCfis.add(w.cfi);
     } catch {
@@ -449,10 +458,11 @@ export function applyHighlightsToRendition(
             exampleOrDate: q.date ? `Дата: ${q.date}` : "",
             targetFilePath: activeQuotesFilePath,
             lineNumber: q.lineNumber,
+            hostContainer,
           });
         },
         "my-epub-hl-quote",
-        highlightStyles("#e5a158", "0.30")
+        highlightStyles("#e5a158", "0.30", themeMode)
       );
       appliedCfis.add(q.cfi);
     } catch {
@@ -461,16 +471,23 @@ export function applyHighlightsToRendition(
   }
 }
 
-// --- Быстрый перевод на лету без сохранения в словарь (без автоозвучки) ---
+// --- Быстрый перевод на лету без сохранения в словарь ---
 export class QuickTranslateModal extends Modal {
   textToTranslate: string;
+  autoSpeak: boolean;
   onSaveToVocab: (word: string) => void;
 
-  constructor(app: App, textToTranslate: string, onSaveToVocab: (word: string) => void) {
+  constructor(
+    app: App,
+    textToTranslate: string,
+    onSaveToVocab: (word: string) => void,
+    autoSpeak = false
+  ) {
     super(app);
     (this as unknown as { shouldRestoreSelection?: boolean }).shouldRestoreSelection = false;
     this.textToTranslate = textToTranslate;
     this.onSaveToVocab = onSaveToVocab;
+    this.autoSpeak = autoSpeak;
     configureTranslationCache(app);
   }
 
@@ -500,13 +517,22 @@ export class QuickTranslateModal extends Modal {
       placeholder: "Слово или фраза на английском…",
     });
 
+const speakBtn = topRow.createEl("button", {
+      cls: "my-epub-modal-btn",
+      text: "🔊",
+      attr: { title: "Озвучить", "aria-label": "Озвучить" },
+    });
+    speakBtn.onclick = () => speakEnglishText(input.value);
+
     const trBtn = topRow.createEl("button", {
       cls: "my-epub-modal-btn",
       text: "Перевести",
     });
 
     const resultBox = contentEl.createDiv("my-epub-variants-box");
-    resultBox.setText("⏳ Перевожу…");
+    resultBox.setText(
+      this.textToTranslate.trim() ? "⏳ Перевожу…" : "Введи слово или фразу и нажми «Перевести»."
+    );
 
     const footer = contentEl.createDiv("my-epub-modal-row-end");
     const toVocabBtn = footer.createEl("button", {
@@ -564,7 +590,12 @@ export class QuickTranslateModal extends Modal {
       }
     };
 
-    await runLookup();
+if (this.textToTranslate.trim()) {
+      if (this.autoSpeak) speakEnglishText(this.textToTranslate);
+      await runLookup();
+    } else {
+      window.setTimeout(() => input.focus(), 40);
+    }
   }
 
   onClose() {

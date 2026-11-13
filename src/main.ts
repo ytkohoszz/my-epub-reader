@@ -132,13 +132,24 @@ export default class MyEpubPlugin extends Plugin {
       },
     });
 
-    this.addCommand({
+this.addCommand({
       id: "link-or-create-book-note",
       name: "Привязать или создать заметку книги",
       checkCallback: (checking: boolean) => {
         const view = this.app.workspace.getActiveViewOfType(EpubView);
         if (!view) return false;
         if (!checking) view.openBookLinkModal();
+        return true;
+      },
+    });
+
+    this.addCommand({
+      id: "open-linked-book-note",
+      name: "Открыть заметку текущей книги",
+      checkCallback: (checking: boolean) => {
+        const view = this.app.workspace.getActiveViewOfType(EpubView);
+        if (!view) return false;
+        if (!checking) void view.openLinkedBookNote();
         return true;
       },
     });
