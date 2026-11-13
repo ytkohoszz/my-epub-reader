@@ -356,10 +356,25 @@ try {
       }
     };
 
+const checkIframeSelectionOrHide = () => {
+      try {
+        const sel = win?.getSelection?.() || doc.getSelection?.();
+        const raw = sel?.toString() || "";
+        if (raw.trim().length > 0) {
+          saveCapturedText(view, raw, undefined, contents, sel);
+        } else if (view.capturedWord || view.capturedQuote) {
+          view.clearCapturedSelection();
+        }
+      } catch {
+        // Игнорируем
+      }
+    };
+
     const onDocTouchEnd = () => {
       view.recordReadingActivity();
-      view.scheduleSelectionTimer(checkIframeSelection, 30);
-      view.scheduleSelectionTimer(checkIframeSelection, 180);
+      view.scheduleSelectionTimer(checkIframeSelectionOrHide, 40);
+      view.scheduleSelectionTimer(checkIframeSelectionOrHide, 220);
+      view.scheduleSelectionTimer(checkIframeSelectionOrHide, 450);
     };
 
 const onDocMouseUp = () => {

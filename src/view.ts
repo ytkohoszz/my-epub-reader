@@ -1072,6 +1072,18 @@ showSelectionFloatingBar(contentsObj?: EpubContentsExtended, selObj?: Selection 
       return;
     }
 
+    // На iPhone и iPad в WKWebView координаты range.getBoundingClientRect() внутри многоколоночного
+    // iframe epub.js часто смещаются на тысячи пикселей по X, а сверху выделение закрывает лупа iOS.
+    // Поэтому на мобильных платформах показываем капсулу как парящий док над нижней панелью.
+    if (Platform.isMobile) {
+      this.selFloatBarEl.addClass("is-mobile-dock", "is-visible");
+      this.selFloatBarEl.style.removeProperty("left");
+      this.selFloatBarEl.style.removeProperty("top");
+      return;
+    }
+
+    this.selFloatBarEl.removeClass("is-mobile-dock");
+
     try {
       let activeSel = selObj ?? null;
       let doc: Document | undefined = contentsObj?.document;
@@ -1113,9 +1125,7 @@ showSelectionFloatingBar(contentsObj?: EpubContentsExtended, selObj?: Selection 
       const maxLeft = Math.max(minLeft, rootRect.width - popWidth - 8);
       const clampedLeft = Math.max(minLeft, Math.min(maxLeft, selCenterX - popWidth / 2));
 
-      // На тач-устройствах iOS/iPadOS рисует системное меню сверху от выделения — ставим нашу капсулу снизу.
-      // На десктопе ставим сверху (с фоллбэком вниз, если выделение у верхнего края).
-      const preferBelow = Platform.isMobile || selTop < popHeight + 24;
+      const preferBelow = selTop < popHeight + 24;
       let targetTop = preferBelow ? selBottom + 14 : selTop - popHeight - 10;
 
       const maxTop = Math.max(8, rootRect.height - popHeight - 68);
