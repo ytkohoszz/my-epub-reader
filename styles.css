@@ -411,13 +411,13 @@ body:not(.is-mobile) .my-epub:not(.my-epub-bar-is-top) .my-epub-bar {
   position: absolute;
   left: 50%;
   transform: translateX(-50%);
-  bottom: calc(0.45rem + env(safe-area-inset-bottom, 0px));
+  bottom: max(0.35rem, calc(env(safe-area-inset-bottom, 0px) * 0.45));
   max-width: calc(100vw - 16px);
   box-sizing: border-box;
   align-items: center;
   justify-content: center;
   gap: 0.25rem;
-  padding: 0.2rem 0.35rem;
+  padding: 0.18rem 0.32rem;
   border-radius: 999px;
   background: var(--background-secondary);
   border: 1px solid var(--background-modifier-border);
@@ -517,9 +517,19 @@ body.my-epub-fullscreen.my-epub-sepia-bg .workspace-leaf-content {
   background-color: #f4ecd8 !important;
 }
 
+body.my-epub-fullscreen .workspace-leaf-content,
+body.my-epub-fullscreen .view-content.my-epub {
+  padding-top: max(0.25rem, env(safe-area-inset-top, 0px)) !important;
+  margin-top: 0 !important;
+}
+
 body.my-epub-fullscreen .my-epub-wrap {
-  padding-top: 0.15rem !important;
-  padding-bottom: calc(2.7rem + env(safe-area-inset-bottom, 0px)) !important;
+  padding-top: 0.1rem !important;
+  padding-bottom: calc(3.55rem + env(safe-area-inset-bottom, 0px) * 0.45) !important;
+}
+
+.is-phone body.my-epub-fullscreen .my-epub-wrap {
+  padding-bottom: calc(3.35rem + env(safe-area-inset-bottom, 0px) * 0.45) !important;
 }
 
 /* Вкладки окна навигации */
