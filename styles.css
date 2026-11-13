@@ -112,6 +112,32 @@ body:not(.is-mobile) .my-epub-box {
   display: inline-flex;
 }
 
+/* На iPad и iPhone капсула выделения всегда по центру над нижней панелью — не перекрывает лупу iOS и не уезжает в колонках */
+.my-epub-sel-popover.is-mobile-dock {
+  top: auto !important;
+  left: 50% !important;
+  transform: translateX(-50%);
+  bottom: calc(4.35rem + env(safe-area-inset-bottom, 0px));
+  max-width: calc(100vw - 16px);
+  padding: 0.34rem 0.44rem;
+  gap: 0.32rem;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.32) !important;
+}
+
+.my-epub.my-epub-in-fullscreen .my-epub-sel-popover.is-mobile-dock {
+  bottom: calc(3.3rem + env(safe-area-inset-bottom, 0px) * 0.45);
+}
+
+.is-phone .my-epub:not(.my-epub-in-fullscreen) .my-epub-sel-popover.is-mobile-dock {
+  bottom: calc(7.4rem + env(safe-area-inset-bottom, 0px));
+}
+
+.my-epub-sel-popover.is-mobile-dock .my-epub-sel-btn {
+  min-height: 38px !important;
+  padding: 0 0.68rem !important;
+  font-size: 0.85rem !important;
+}
+
 .my-epub-sel-btn {
   min-height: 32px !important;
   min-width: 32px !important;
@@ -519,7 +545,15 @@ body.my-epub-fullscreen.my-epub-sepia-bg .workspace-leaf-content {
 
 body.my-epub-fullscreen .workspace-leaf-content,
 body.my-epub-fullscreen .view-content.my-epub {
-  padding-top: max(0.25rem, env(safe-area-inset-top, 0px)) !important;
+  padding-top: 0 !important;
+  margin-top: 0 !important;
+}
+
+/* На iPhone убираем пустую шапку под Dynamic Island / статус-бар в полноэкранном режиме */
+.is-phone body.my-epub-fullscreen .workspace-split.mod-root,
+.is-phone body.my-epub-fullscreen .workspace-tabs,
+.is-phone body.my-epub-fullscreen .workspace-leaf {
+  padding-top: 0 !important;
   margin-top: 0 !important;
 }
 
@@ -529,6 +563,7 @@ body.my-epub-fullscreen .my-epub-wrap {
 }
 
 .is-phone body.my-epub-fullscreen .my-epub-wrap {
+  padding-top: 0 !important;
   padding-bottom: calc(3.35rem + env(safe-area-inset-bottom, 0px) * 0.45) !important;
 }
 
