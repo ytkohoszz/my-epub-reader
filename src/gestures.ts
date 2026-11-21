@@ -311,12 +311,11 @@ export function setupViewGesturesAndSelection(view: EpubView) {
     }
   });
 
-  view.rendition.hooks.content.register((contents: EpubContentsExtended) => {
+view.rendition.hooks.content.register((contents: EpubContentsExtended) => {
     const doc = contents?.document;
     const win = contents?.window;
     if (!doc) return;
 
-    view.applyStyles();
     attachTouchHandlers(view, doc, true, contents);
     attachInternalLinkInterceptor(view, doc);
 

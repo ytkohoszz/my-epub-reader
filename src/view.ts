@@ -658,11 +658,12 @@ private startReadingTimer() {
     this.currentChapterTitle = "";
     this.pendingYamlSync = false;
 
-    this.trySilentResolveLinkedBookNote(file);
+this.trySilentResolveLinkedBookNote(file);
     const initialPos = resolveInitialCfiBeforeRender(this, file);
     const openTargetCfi = toNavigationCfi(this.pendingOpenCfi);
     this.pendingOpenCfi = null;
-    this.stableCfi = openTargetCfi ?? initialPos.cfi;
+    const intendedInitialCfi = openTargetCfi ?? initialPos.cfi;
+    this.stableCfi = intendedInitialCfi;
     this.lastLocalPositionSavedAt = openTargetCfi
       ? new Date().toISOString()
       : initialPos.savedAt;
@@ -866,16 +867,30 @@ prev.onclick = () => this.turnPage("prev");
       await this.refreshBookHighlights();
       if (currentLoadId !== this.loadId || this.isClosing || !this.book || !this.rendition) return;
 
-      const loadedFromCache = await tryLoadCachedLocations(this, file, currentLoadId);
+const loadedFromCache = await tryLoadCachedLocations(this, file, currentLoadId);
       if (currentLoadId !== this.loadId || this.isClosing || !this.book || !this.rendition) return;
 
       const rendExt = this.rendition as unknown as EpubRenditionExtended;
       const cur = rendExt.currentLocation?.();
       const curCfi = toNavigationCfi(cur?.start?.cfi);
-      if (curCfi) {
+
+      if (intendedInitialCfi && !this.userHasNavigated && curCfi !== intendedInitialCfi) {
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 80));
+        if (currentLoadId !== this.loadId || this.isClosing || !this.rendition) return;
+        try {
+          await this.rendition.display(intendedInitialCfi);
+        } catch {
+          // Игнорируем
+        }
+        if (currentLoadId !== this.loadId || this.isClosing || !this.rendition) return;
+        const afterCur = rendExt.currentLocation?.();
+        if (afterCur) captureChapterMetricsFromLoc(this, afterCur);
+        this.stableCfi = intendedInitialCfi;
+        this.updateProgressLabels(intendedInitialCfi);
+      } else if (curCfi) {
         if (cur) captureChapterMetricsFromLoc(this, cur);
-        this.stableCfi = curCfi;
-        this.updateProgressLabels(curCfi);
+        this.stableCfi = intendedInitialCfi ?? curCfi;
+        this.updateProgressLabels(this.stableCfi);
       }
 
       if (loadedFromCache) {
@@ -1772,10 +1787,12 @@ if (this.bookWords.length > 0 || this.bookQuotes.length > 0) {
       const rawIdx = Number(this.book.locations.locationFromCfi(cleanCfi));
       const rawFrac = this.book.locations.percentageFromCfi(cleanCfi);
       const idx = Number.isFinite(rawIdx) && rawIdx >= 0 ? rawIdx : 0;
-      const page = Math.max(1, Math.min(total, idx + 1));
-      const pct = Number.isFinite(rawFrac) && rawFrac >= 0
-        ? Math.max(0, Math.min(100, Math.round(rawFrac * 100)))
-        : Math.max(0, Math.min(100, Math.round((page / total) * 100)));
+const page = Math.max(1, Math.min(total, idx + 1));
+      const pct = page >= total
+        ? 100
+        : Number.isFinite(rawFrac) && rawFrac >= 0
+          ? Math.max(0, Math.min(100, Math.round(rawFrac * 100)))
+          : Math.max(0, Math.min(100, Math.round((page / total) * 100)));
 
       this.currentPageNum = page;
       this.totalPagesNum = total;
@@ -1810,19 +1827,18 @@ this.infoTextEl?.setText(`${bmMark}${page}/${total} · ${pct}%${chapterLeftSuffi
       return;
     }
 
-    this.recordReadingActivity();
+this.recordReadingActivity();
     captureChapterMetricsFromLoc(this, loc);
-    this.stableCfi = cfi;
 
     if (this.isInitialLoadDone || this.userHasNavigated) {
+      this.stableCfi = cfi;
       const nowIso = new Date().toISOString();
       this.lastLocalPositionSavedAt = nowIso;
       this.plugin.setLocalBookProgress(file.path, cfi, nowIso);
       this.updateProgressLabels(cfi);
       this.requestYamlProgressSync();
-    } else {
-      this.plugin.settings.progress[file.path] = cfi;
-      this.plugin.requestSaveSettings();
+    } else if (!this.stableCfi) {
+      this.stableCfi = cfi;
       this.updateProgressLabels(cfi);
     }
   }
