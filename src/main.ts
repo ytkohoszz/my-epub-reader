@@ -10,6 +10,7 @@ import {
 } from "./settings";
 import { EpubView } from "./view";
 import { toNavigationCfi } from "./navigation";
+import { flushTranslationCache } from "./modals";
 
 export { EpubView } from "./view";
 export type { Settings, LocationIndexMeta } from "./settings";
@@ -321,7 +322,7 @@ this.addCommand({
     }
   }
 
-  async flushAllViewsAndSettings() {
+async flushAllViewsAndSettings() {
     const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
     for (const leaf of leaves) {
       const view = leaf.view;
@@ -330,6 +331,7 @@ this.addCommand({
       }
     }
     await this.flushSaveSettings();
+    await flushTranslationCache();
   }
 
   syncGlobalBodyClasses() {
@@ -368,20 +370,26 @@ this.addCommand({
       this.setLocalBookProgress(targetFile.path, navCfi, new Date().toISOString());
     }
 
-    const existingLeaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
+const existingLeaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
     for (const leaf of existingLeaves) {
       const view = leaf.view;
       if (view instanceof EpubView && view.file?.path === targetFile.path) {
-        if (navCfi) view.ExplicitCfiJumpPending = true;
         this.app.workspace.setActiveLeaf(leaf, { focus: true });
-        if (navCfi) await view.jumpToCfi(navCfi, true);
+        if (navCfi && toNavigationCfi(view.stableCfi) !== navCfi) {
+          view.ExplicitCfiJumpPending = true;
+          await view.jumpToCfi(navCfi, true);
+        }
         return;
       }
     }
 
     const leaf = this.app.workspace.getLeaf(false);
     await leaf.openFile(targetFile);
-    if (navCfi && leaf.view instanceof EpubView) {
+    if (
+      navCfi &&
+      leaf.view instanceof EpubView &&
+      toNavigationCfi(leaf.view.stableCfi) !== navCfi
+    ) {
       await leaf.view.jumpToCfi(navCfi, false);
     }
   }

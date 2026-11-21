@@ -28,10 +28,14 @@ export interface BookQuoteEntry {
   lineNumber: number;
 }
 
-let activeAnnotationsApp: App | null = null;
-let activeWordsFilePath = "Words Cards";
-let activeQuotesFilePath = "Знания/Цитаты из книг.md";
-let activeHighlightPopoverCleanup: (() => void) | null = null;
+export interface HighlightContextOptions {
+  app: App;
+  wordsFilePath: string;
+  quotesFilePath: string;
+  hostContainer?: HTMLElement | null;
+}
+
+const activePopoversByHost = new WeakMap<HTMLElement, () => void>();
 
 const decodeInline = (s: string) =>
   String(s ?? "").replace(/⟩/g, ")").replace(/⟨/g, "(").trim();
@@ -109,9 +113,8 @@ export async function loadBookAnnotationsFromVault(
   wordsFilePath: string,
   quotesFilePath: string
 ): Promise<{ words: BookWordEntry[]; quotes: BookQuoteEntry[] }> {
-  activeAnnotationsApp = app;
-  activeWordsFilePath = wordsFilePath || "Words Cards";
-  activeQuotesFilePath = quotesFilePath || "Знания/Цитаты из книг.md";
+  const resolvedWordsPath = wordsFilePath || "Words Cards";
+  const resolvedQuotesPath = quotesFilePath || "Знания/Цитаты из книг.md";
   configureTranslationCache(app);
 
   if (!linkedBook) return { words: [], quotes: [] };
@@ -119,7 +122,7 @@ export async function loadBookAnnotationsFromVault(
   const words: BookWordEntry[] = [];
   const quotes: BookQuoteEntry[] = [];
 
-  const wordsFile = resolveVaultFile(app, activeWordsFilePath);
+  const wordsFile = resolveVaultFile(app, resolvedWordsPath);
   if (wordsFile) {
     try {
       const content = await app.vault.cachedRead(wordsFile);
@@ -174,7 +177,7 @@ export async function loadBookAnnotationsFromVault(
     }
   }
 
-  const quotesFile = resolveVaultFile(app, activeQuotesFilePath);
+const quotesFile = resolveVaultFile(app, resolvedQuotesPath);
   if (quotesFile) {
     try {
       const content = await app.vault.cachedRead(quotesFile);
@@ -236,10 +239,14 @@ function highlightStyles(
   };
 }
 
-function closeActiveHighlightPopover() {
-  if (activeHighlightPopoverCleanup) {
-    const fn = activeHighlightPopoverCleanup;
-    activeHighlightPopoverCleanup = null;
+export function closeHighlightPopover(hostContainer?: HTMLElement | null) {
+  const hostEl =
+    hostContainer ||
+    (document.querySelector(".view-content.my-epub") as HTMLElement | null) ||
+    document.body;
+  const fn = activePopoversByHost.get(hostEl);
+  if (fn) {
+    activePopoversByHost.delete(hostEl);
     try {
       fn();
     } catch {
@@ -251,6 +258,7 @@ function closeActiveHighlightPopover() {
 function showHighlightPopoverCard(
   rendition: Rendition,
   opts: {
+    app: App;
     type: "word" | "quote";
     title: string;
     translationOrQuote: string;
@@ -261,12 +269,12 @@ function showHighlightPopoverCard(
     hostContainer?: HTMLElement | null;
   }
 ) {
-  closeActiveHighlightPopover();
-
   const hostEl =
     opts.hostContainer ||
     (document.querySelector(".view-content.my-epub") as HTMLElement | null) ||
     document.body;
+
+  closeHighlightPopover(hostEl);
 
   const cardEl = hostEl.createDiv({
     cls:
@@ -288,7 +296,7 @@ function showHighlightPopoverCard(
     text: "✕",
     attr: { type: "button", "aria-label": "Закрыть карточку" },
   });
-  closeBtn.onclick = () => closeActiveHighlightPopover();
+closeBtn.onclick = () => closeHighlightPopover(hostEl);
 
   const mainBody = cardEl.createDiv("my-epub-hl-card-body");
   mainBody.setText(opts.translationOrQuote);
@@ -317,16 +325,16 @@ function showHighlightPopoverCard(
     text: `📄 Перейти в карточку (стр. ${opts.lineNumber})`,
     attr: { type: "button" },
   });
-  openLineBtn.onclick = () => {
-    closeActiveHighlightPopover();
-    void openVaultFileAtLine(activeAnnotationsApp, opts.targetFilePath, opts.lineNumber);
+openLineBtn.onclick = () => {
+    closeHighlightPopover(hostEl);
+    void openVaultFileAtLine(opts.app, opts.targetFilePath, opts.lineNumber);
   };
 
   const cleanupTargets: Array<() => void> = [];
   const onOutsideTap = (ev: Event) => {
     const target = ev.target as Node | null;
     if (target && cardEl.contains(target)) return;
-    closeActiveHighlightPopover();
+    closeHighlightPopover(hostEl);
   };
 
   const timerId = window.setTimeout(() => {
@@ -355,14 +363,14 @@ function showHighlightPopoverCard(
     }
   }, 60);
 
-  const onRelocatedClose = () => closeActiveHighlightPopover();
+const onRelocatedClose = () => closeHighlightPopover(hostEl);
   try {
     rendition.on("relocated", onRelocatedClose);
   } catch {
     // Игнорируем
   }
 
-  activeHighlightPopoverCleanup = () => {
+  activePopoversByHost.set(hostEl, () => {
     window.clearTimeout(timerId);
     for (const fn of cleanupTargets) {
       try {
@@ -377,7 +385,7 @@ function showHighlightPopoverCard(
       // Игнорируем
     }
     cardEl.remove();
-  };
+  });
 }
 
 export function applyHighlightsToRendition(
@@ -386,9 +394,9 @@ export function applyHighlightsToRendition(
   words: BookWordEntry[],
   quotes: BookQuoteEntry[],
   themeMode: "auto" | "sepia" | "night" = "auto",
-  hostContainer?: HTMLElement | null
+  ctx: HighlightContextOptions
 ) {
-  closeActiveHighlightPopover();
+  closeHighlightPopover(ctx.hostContainer);
   if (!rendition || !rendition.annotations) return;
 
   for (const oldCfi of appliedCfis) {
@@ -400,6 +408,9 @@ export function applyHighlightsToRendition(
   }
   appliedCfis.clear();
 
+  const wordsPath = ctx.wordsFilePath || "Words Cards";
+  const quotesPath = ctx.quotesFilePath || "Знания/Цитаты из книг.md";
+
   for (const w of words) {
     if (!w.cfi || !w.cfi.startsWith("epubcfi(") || !w.cfi.includes(",")) continue;
     try {
@@ -408,14 +419,15 @@ export function applyHighlightsToRendition(
         {},
         () => {
           showHighlightPopoverCard(rendition, {
+            app: ctx.app,
             type: "word",
             title: w.word,
             translationOrQuote: w.back,
             exampleOrDate: w.example ? `«${w.example}»` : "",
             speakWord: w.word,
-            targetFilePath: activeWordsFilePath,
+            targetFilePath: wordsPath,
             lineNumber: w.lineNumber,
-            hostContainer,
+            hostContainer: ctx.hostContainer,
           });
         },
         "my-epub-hl-word",
@@ -435,13 +447,14 @@ export function applyHighlightsToRendition(
         {},
         () => {
           showHighlightPopoverCard(rendition, {
+            app: ctx.app,
             type: "quote",
             title: "Цитата",
             translationOrQuote: `«${q.text}»`,
             exampleOrDate: q.date ? `Дата: ${q.date}` : "",
-            targetFilePath: activeQuotesFilePath,
+            targetFilePath: quotesPath,
             lineNumber: q.lineNumber,
-            hostContainer,
+            hostContainer: ctx.hostContainer,
           });
         },
         "my-epub-hl-quote",

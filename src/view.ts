@@ -23,6 +23,7 @@ import {
   BookWordEntry,
   QuickTranslateModal,
   applyHighlightsToRendition,
+  closeHighlightPopover,
   loadBookAnnotationsFromVault,
 } from "./highlights";
 import {
@@ -444,6 +445,10 @@ info!: HTMLElement;
 private workspaceEventsRegistered = false;
   private selectionTimers = new Set<number>();
   private mobileSelectionPollTimer: number | null = null;
+  private lastPolledMobileSel = "";
+  private isTurning = false;
+  private turnUnlockTimer: number | null = null;
+  chapterCleanups = new Set<{ isConnected: () => boolean; cleanup: () => void }>();
 
   turnDurationsMs: number[] = [];
   lastTransitionTimestamp = 0;
@@ -545,12 +550,19 @@ private startReadingTimer() {
       }
     }, READING_TICK_INTERVAL_MS);
 
-    if (Platform.isMobile) {
+if (Platform.isMobile) {
       if (this.mobileSelectionPollTimer !== null) {
         window.clearInterval(this.mobileSelectionPollTimer);
       }
       this.mobileSelectionPollTimer = window.setInterval(() => {
-        if (this.isClosing || document.querySelector(".modal-container")) return;
+        if (
+          this.isClosing ||
+          document.visibilityState === "hidden" ||
+          this.app.workspace.getActiveViewOfType(EpubView) !== this ||
+          document.querySelector(".modal-container")
+        ) {
+          return;
+        }
         this.pollMobileIframeSelection();
       }, 250);
     }
@@ -564,14 +576,20 @@ private startReadingTimer() {
         const win = frame.contentWindow;
         const doc = frame.contentDocument;
         const sel = win?.getSelection?.() || doc?.getSelection?.();
-        const raw = sel?.toString() || "";
-        if (raw.trim().length > 0) {
-          syncSelectionFromAllIframes(this);
-          this.showSelectionFloatingBar(undefined, sel);
+        const raw = (sel?.toString() || "").trim();
+        if (raw.length > 0) {
+          if (
+            raw !== this.lastPolledMobileSel ||
+            !this.selFloatBarEl?.hasClass("is-visible")
+          ) {
+            this.lastPolledMobileSel = raw;
+            syncSelectionFromAllIframes(this);
+          }
           return;
         }
       }
-      if (this.capturedWord || this.capturedQuote) {
+      if (this.lastPolledMobileSel || this.capturedWord || this.capturedQuote) {
+        this.lastPolledMobileSel = "";
         this.clearCapturedSelection();
       }
     } catch {
@@ -948,7 +966,12 @@ applyHighlightsToRendition(
       this.bookWords,
       this.bookQuotes,
       this.plugin.settings.themeMode ?? "auto",
-      this.contentEl
+      {
+        app: this.app,
+        wordsFilePath: this.plugin.settings.wordsFilePath || "Words Cards",
+        quotesFilePath: this.plugin.settings.quotesFilePath || "Знания/Цитаты из книг.md",
+        hostContainer: this.contentEl,
+      }
     );
   }
 
@@ -1126,7 +1149,8 @@ showSelectionFloatingBar(contentsObj?: EpubContentsExtended, selObj?: Selection 
     this.selFloatBarEl?.removeClass("is-visible");
   }
 
-  clearCapturedSelection() {
+clearCapturedSelection() {
+    this.lastPolledMobileSel = "";
     this.capturedWord = "";
     this.capturedQuote = "";
     this.capturedCfi = null;
@@ -1366,8 +1390,19 @@ showError(fileName: string, details: string) {
     this.contentEl.toggleClass("my-epub-bar-is-top", isTop);
   }
 
-  turnPage(dir: "next" | "prev") {
-    if (!this.rendition || this.isClosing) return;
+turnPage(dir: "next" | "prev") {
+    if (!this.rendition || this.isClosing || this.isTurning) return;
+    this.isTurning = true;
+    if (this.turnUnlockTimer !== null) window.clearTimeout(this.turnUnlockTimer);
+    const unlock = () => {
+      this.isTurning = false;
+      if (this.turnUnlockTimer !== null) {
+        window.clearTimeout(this.turnUnlockTimer);
+        this.turnUnlockTimer = null;
+      }
+    };
+    this.turnUnlockTimer = window.setTimeout(unlock, 550);
+
     this.userHasNavigated = true;
     this.progressPersistenceBlocked = false;
     this.recordReadingActivity();
@@ -1403,11 +1438,8 @@ showError(fileName: string, details: string) {
       }, 240);
     }
 
-    if (dir === "next") {
-      void this.rendition.next();
-    } else {
-      void this.rendition.prev();
-    }
+    const turnPromise = dir === "next" ? this.rendition.next() : this.rendition.prev();
+    void Promise.resolve(turnPromise).catch(() => undefined).finally(unlock);
   }
 
   toggleFullscreen(force?: boolean) {
@@ -1650,7 +1682,12 @@ if (this.bookWords.length > 0 || this.bookQuotes.length > 0) {
         this.bookWords,
         this.bookQuotes,
         mode,
-        this.contentEl
+        {
+          app: this.app,
+          wordsFilePath: this.plugin.settings.wordsFilePath || "Words Cards",
+          quotesFilePath: this.plugin.settings.quotesFilePath || "Знания/Цитаты из книг.md",
+          hostContainer: this.contentEl,
+        }
       );
     }
   }
@@ -1739,16 +1776,23 @@ this.recordReadingActivity();
     }
   }
 
-  cleanupView() {
+cleanupView() {
     this.loadId++;
     this.navigationInFlight = false;
     this.ExplicitCfiJumpPending = Boolean(this.pendingOpenCfi);
     this.isFullscreen = false;
     this.isInitialLoadDone = false;
     this.isGeneratingLocations = false;
+    this.isTurning = false;
+    this.lastPolledMobileSel = "";
     this.navHistory = [];
+    closeHighlightPopover(this.contentEl);
     this.plugin.syncGlobalBodyClasses();
-if (this.readingTickTimer !== null) {
+    if (this.turnUnlockTimer !== null) {
+      window.clearTimeout(this.turnUnlockTimer);
+      this.turnUnlockTimer = null;
+    }
+    if (this.readingTickTimer !== null) {
       window.clearInterval(this.readingTickTimer);
       this.readingTickTimer = null;
     }
@@ -1768,6 +1812,10 @@ if (this.readingTickTimer !== null) {
       window.clearTimeout(timerId);
     }
     this.selectionTimers.clear();
+    for (const entry of Array.from(this.chapterCleanups)) {
+      try { entry.cleanup(); } catch { /* ignore */ }
+    }
+    this.chapterCleanups.clear();
     for (const fn of this.cleanupListeners) {
       try { fn(); } catch { /* ignore */ }
     }

@@ -1,5 +1,4 @@
 import { App, DataAdapter, Modal, Notice, TFile, requestUrl } from "obsidian";
-import { NavItem } from "epubjs";
 import type MyEpubPlugin from "./main";
 import { globalObsidianApp, isRecord } from "./navigation";
 import { getErrorMessage } from "./settings";
@@ -321,23 +320,34 @@ function pruneTranslationCacheInMemory() {
   }
 }
 
+async function writeTranslationCacheToDisk(): Promise<void> {
+  const resolved = resolveCacheAdapterAndPath();
+  if (!resolved) return;
+  try {
+    pruneTranslationCacheInMemory();
+    const obj: Record<string, TranslationCacheRecord> = {};
+    for (const [k, v] of translationCache.entries()) {
+      obj[k] = v;
+    }
+    await resolved.adapter.write(resolved.path, JSON.stringify(obj));
+  } catch {
+    // Игнорируем
+  }
+}
+
 function scheduleSaveTranslationCache() {
   if (cacheSaveTimer !== null) window.clearTimeout(cacheSaveTimer);
-  cacheSaveTimer = window.setTimeout(async () => {
+  cacheSaveTimer = window.setTimeout(() => {
     cacheSaveTimer = null;
-    const resolved = resolveCacheAdapterAndPath();
-    if (!resolved) return;
-    try {
-      pruneTranslationCacheInMemory();
-      const obj: Record<string, TranslationCacheRecord> = {};
-      for (const [k, v] of translationCache.entries()) {
-        obj[k] = v;
-      }
-      await resolved.adapter.write(resolved.path, JSON.stringify(obj));
-    } catch {
-      // Игнорируем
-    }
+    void writeTranslationCacheToDisk();
   }, TRANSLATION_CACHE_DEBOUNCE_MS);
+}
+
+export async function flushTranslationCache(): Promise<void> {
+  if (cacheSaveTimer === null) return;
+  window.clearTimeout(cacheSaveTimer);
+  cacheSaveTimer = null;
+  await writeTranslationCacheToDisk();
 }
 
 const DESKTOP_HEADERS: Record<string, string> = {
@@ -592,53 +602,6 @@ function safeCloseModal(modal: Modal) {
     modal.close();
   } catch (e) {
     console.log("Safe modal close:", e);
-  }
-}
-
-export class TocModal extends Modal {
-  toc: NavItem[];
-  onSelect: (href: string) => void;
-
-  constructor(app: App, toc: NavItem[], onSelect: (href: string) => void) {
-    super(app);
-    (this as unknown as { shouldRestoreSelection?: boolean }).shouldRestoreSelection = false;
-    this.toc = toc;
-    this.onSelect = onSelect;
-  }
-
-  onOpen() {
-    (this as unknown as { shouldRestoreSelection?: boolean }).shouldRestoreSelection = false;
-    const { contentEl } = this;
-    contentEl.empty();
-    contentEl.addClass("my-epub-toc-modal");
-    contentEl.createEl("h3", { text: "📑 Оглавление" });
-
-    if (!this.toc || this.toc.length === 0) {
-      contentEl.createDiv({ cls: "my-epub-toc-empty", text: "В этой книге нет оглавления." });
-      return;
-    }
-
-    const list = contentEl.createDiv("my-epub-toc-list");
-    this.renderItems(list, this.toc, 0);
-  }
-
-  renderItems(container: HTMLElement, items: NavItem[], level: number) {
-    for (const item of items) {
-      const row = container.createDiv({ cls: "my-epub-toc-item" });
-      row.style.paddingLeft = `${0.75 + level * 1.25}rem`;
-      row.setText((item.label || "Без названия").trim());
-      row.onclick = () => {
-        safeCloseModal(this);
-        this.onSelect(item.href);
-      };
-      if (item.subitems && item.subitems.length > 0) {
-        this.renderItems(container, item.subitems, level + 1);
-      }
-    }
-  }
-
-  onClose() {
-    this.contentEl.empty();
   }
 }
 

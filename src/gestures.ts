@@ -401,12 +401,15 @@ const onDocMouseUp = () => {
       else view.turnPage("prev");
     };
 
-    doc.addEventListener("selectionchange", onThrottledSelectionChange);
+doc.addEventListener("selectionchange", onThrottledSelectionChange);
     doc.addEventListener("touchend", onDocTouchEnd, { passive: true });
     doc.addEventListener("mouseup", onDocMouseUp);
     doc.addEventListener("wheel", onDocWheel, { passive: false });
 
-    view.cleanupListeners.push(() => {
+    let chapterCleaned = false;
+    const cleanupChapter = () => {
+      if (chapterCleaned) return;
+      chapterCleaned = true;
       if (selThrottleTimer !== null) {
         view.clearSelectionTimer(selThrottleTimer);
         selThrottleTimer = null;
@@ -415,7 +418,23 @@ const onDocMouseUp = () => {
       doc.removeEventListener("touchend", onDocTouchEnd);
       doc.removeEventListener("mouseup", onDocMouseUp);
       doc.removeEventListener("wheel", onDocWheel);
-    });
+      win?.removeEventListener("pagehide", cleanupChapter);
+      win?.removeEventListener("unload", cleanupChapter);
+      view.chapterCleanups.delete(chapterEntry);
+    };
+
+    const chapterEntry = {
+      isConnected: () => Boolean(doc.defaultView?.frameElement?.isConnected),
+      cleanup: cleanupChapter,
+    };
+
+    for (const prevEntry of Array.from(view.chapterCleanups)) {
+      if (!prevEntry.isConnected()) prevEntry.cleanup();
+    }
+    view.chapterCleanups.add(chapterEntry);
+
+    win?.addEventListener("pagehide", cleanupChapter, { once: true });
+    win?.addEventListener("unload", cleanupChapter, { once: true });
   });
 
   if (view.wrapEl) {
