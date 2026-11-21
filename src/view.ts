@@ -14,16 +14,13 @@ import {
   AddWordModal,
   BookLinkModal,
   BookNoteInfo,
-  JumpToPageModal,
+JumpToPageModal,
   findMatchingBookNotes,
-  getTodayISO,
   loadBookNotesFromVault,
 } from "./modals";
 import {
-  BookNavModal,
   BookQuoteEntry,
   BookWordEntry,
-  BookmarkItem,
   QuickTranslateModal,
   applyHighlightsToRendition,
   loadBookAnnotationsFromVault,
@@ -163,22 +160,9 @@ if (this.view.linkedBookNote) {
       text: linkedLabel,
       attr: { type: "button" },
     });
-    linkBookBtn.onclick = () => {
+linkBookBtn.onclick = () => {
       this.safeClose();
       this.view.openBookLinkModal();
-    };
-
-    const isBm = this.view.isCurrentPageBookmarked();
-    const bmBtn = topActions.createEl("button", {
-      cls: "my-epub-appear-action-btn" + (isBm ? " is-active" : ""),
-      text: isBm
-        ? "🔖 Удалить закладку со страницы"
-        : "🔖 Добавить закладку на странице",
-      attr: { type: "button" },
-    });
-    bmBtn.onclick = () => {
-      this.view.toggleBookmarkOnCurrentPage();
-      this.render();
     };
 
     if (this.view.totalPagesNum && this.view.totalPagesNum > 0) {
@@ -729,15 +713,10 @@ this.selFloatBarEl = root.createDiv("my-epub-sel-popover");
     });
 
 this.fsBarEl = root.createDiv("my-epub-fs-bar");
-    const fsPrev = this.fsBarEl.createEl("button", {
+const fsPrev = this.fsBarEl.createEl("button", {
       cls: "my-epub-fs-btn",
       text: "◀",
       attr: { "aria-label": "Предыдущая страница" },
-    });
-    const fsTocBtn = this.fsBarEl.createEl("button", {
-      cls: "my-epub-fs-btn",
-      text: "📑",
-      attr: { "aria-label": "Оглавление, закладки, слова и поиск" },
     });
     this.fsInfoEl = this.fsBarEl.createSpan({
       cls: "my-epub-fs-info",
@@ -757,7 +736,6 @@ this.fsBarEl = root.createDiv("my-epub-fs-bar");
 
     fsPrev.onclick = (e) => { e.stopPropagation(); this.turnPage("prev"); };
     fsNext.onclick = (e) => { e.stopPropagation(); this.turnPage("next"); };
-    fsTocBtn.onclick = (e) => { e.stopPropagation(); void this.openToc(); };
     fsFontBtn.onclick = (e) => { e.stopPropagation(); this.openTypographyMenu(); };
     this.fsInfoEl.onclick = (e) => { e.stopPropagation(); this.toggleFullscreen(false); };
 
@@ -769,11 +747,6 @@ this.fsBarEl = root.createDiv("my-epub-fs-bar");
       cls: "my-epub-btn",
       text: "◀",
       attr: { "aria-label": "Предыдущая страница" },
-    });
-    const tocBtn = leftGroup.createEl("button", {
-      cls: "my-epub-btn",
-      text: "📑",
-      attr: { "aria-label": "Оглавление, закладки, слова и поиск" },
     });
 
     this.info = this.barEl.createDiv({
@@ -828,7 +801,6 @@ this.fsBarEl = root.createDiv("my-epub-fs-bar");
 prev.onclick = () => this.turnPage("prev");
       next.onclick = () => this.turnPage("next");
       this.fsBtn.onclick = () => this.toggleFullscreen();
-      tocBtn.onclick = () => this.openToc();
       fontBtn.onclick = () => this.openTypographyMenu();
 
       this.rendition.on("relocated", (loc: EpubRelocatedEvent) => {
@@ -978,45 +950,6 @@ applyHighlightsToRendition(
       this.plugin.settings.themeMode ?? "auto",
       this.contentEl
     );
-  }
-
-  toggleBookmarkOnCurrentPage(): BookmarkItem[] {
-    if (!this.file || !this.stableCfi) return [];
-    if (!this.plugin.settings.bookmarks) this.plugin.settings.bookmarks = {};
-    const list = this.plugin.settings.bookmarks[this.file.path] ?? [];
-    const page = this.currentPageNum ?? 1;
-    const pct = this.currentProgressPct ?? this.approxProgressPct ?? 0;
-
-    const existingIdx = list.findIndex((b) => b.page === page || b.cfi === this.stableCfi);
-    if (existingIdx !== -1) {
-      list.splice(existingIdx, 1);
-      new Notice(`Закладка на стр. ${page} удалена`);
-    } else {
-      list.unshift({
-        cfi: this.stableCfi,
-        page,
-        pct,
-        label: this.currentChapterTitle || this.bookTitleMeta || this.file.basename,
-        createdAt: getTodayISO(),
-      });
-      new Notice(`🔖 Добавлена закладка: стр. ${page} (${pct}%)`);
-    }
-
-    this.plugin.settings.bookmarks[this.file.path] = list;
-    this.plugin.requestSaveSettings();
-    this.updateProgressLabels(this.stableCfi);
-    return list;
-  }
-
-  deleteBookmarkByCfi(cfi: string): BookmarkItem[] {
-    if (!this.file || !this.plugin.settings.bookmarks) return [];
-    const list = (this.plugin.settings.bookmarks[this.file.path] ?? []).filter(
-      (b) => b.cfi !== cfi
-    );
-    this.plugin.settings.bookmarks[this.file.path] = list;
-    this.plugin.requestSaveSettings();
-    if (this.stableCfi) this.updateProgressLabels(this.stableCfi);
-    return list;
   }
 
   prepareMainWindowFocusBeforeModal() {
@@ -1487,46 +1420,10 @@ showError(fileName: string, details: string) {
     this.triggerResize(true);
   }
 
-  async openToc() {
-    this.recordReadingActivity();
-    this.prepareMainWindowFocusBeforeModal();
-    await this.refreshBookHighlights();
-    const toc = this.book?.navigation?.toc ?? [];
-    const bmList = this.file ? this.plugin.settings.bookmarks?.[this.file.path] ?? [] : [];
-
-    new BookNavModal(this.app, {
-      book: this.book,
-      toc,
-      bookmarks: bmList,
-      words: this.bookWords,
-      quotes: this.bookQuotes,
-      currentChapterLabel: this.currentChapterTitle || this.bookTitleMeta,
-      currentPage: this.currentPageNum,
-      currentPct: this.currentProgressPct ?? this.approxProgressPct,
-      onSelectToc: (href) => {
-        void this.navigateTo(href, true);
-      },
-      onJumpCfi: (cfi) => {
-        void this.jumpToCfi(cfi, true);
-      },
-      onToggleBookmark: () => this.toggleBookmarkOnCurrentPage(),
-      onDeleteBookmark: (cfi) => this.deleteBookmarkByCfi(cfi),
-    }).open();
-  }
-
-  openTypographyMenu() {
+openTypographyMenu() {
     this.recordReadingActivity();
     this.prepareMainWindowFocusBeforeModal();
     new AppearanceModal(this.app, this).open();
-  }
-
-  isCurrentPageBookmarked(): boolean {
-    if (!this.file) return false;
-    const list = this.plugin.settings.bookmarks?.[this.file.path] ?? [];
-    if (this.currentPageNum) {
-      return list.some((b) => b.page === this.currentPageNum);
-    }
-    return Boolean(this.stableCfi && list.some((b) => b.cfi === this.stableCfi));
   }
 
   triggerResize(force = false) {
@@ -1767,11 +1664,10 @@ if (this.bookWords.length > 0 || this.bookQuotes.length > 0) {
     new Notice(`Размер шрифта: ${s.fontSize}%`);
   }
 
-  updateProgressLabels(cfi: string) {
+updateProgressLabels(cfi: string) {
     if (!this.book) return;
     const cleanCfi = toNavigationCfi(cfi) || cfi;
     const total = this.book.locations.length();
-    const bmMark = this.isCurrentPageBookmarked() ? "🔖 " : "";
     let chapterLeftSuffix = "";
     if (this.chapterPageCurrent !== null && this.chapterPageTotal !== null) {
       const left = Math.max(0, this.chapterPageTotal - this.chapterPageCurrent);
@@ -1799,14 +1695,14 @@ const page = Math.max(1, Math.min(total, idx + 1));
       this.currentProgressPct = pct;
       this.approxProgressPct = pct;
 
-this.infoTextEl?.setText(`${bmMark}${page}/${total} · ${pct}%${chapterLeftSuffix}`);
+this.infoTextEl?.setText(`${page}/${total} · ${pct}%${chapterLeftSuffix}`);
       if (this.progressFillEl) this.progressFillEl.style.width = `${pct}%`;
-      this.fsInfoEl?.setText(`${bmMark}${page}/${total} · ${pct}% ⛶`);
+      this.fsInfoEl?.setText(`${page}/${total} · ${pct}% ⛶`);
     } else {
       const fastPct = computeFastPercentage(this, cleanCfi);
-      this.infoTextEl?.setText(`${bmMark}~${fastPct}%${chapterLeftSuffix}`);
+      this.infoTextEl?.setText(`~${fastPct}%${chapterLeftSuffix}`);
       if (this.progressFillEl) this.progressFillEl.style.width = `${fastPct}%`;
-      this.fsInfoEl?.setText(`${bmMark}~${fastPct}% ⛶`);
+      this.fsInfoEl?.setText(`~${fastPct}% ⛶`);
     }
   }
 

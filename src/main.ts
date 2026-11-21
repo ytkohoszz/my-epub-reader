@@ -67,28 +67,6 @@ export default class MyEpubPlugin extends Plugin {
     });
 
     this.addCommand({
-      id: "toggle-book-page-bookmark",
-      name: "Добавить или удалить закладку на текущей странице",
-      checkCallback: (checking: boolean) => {
-        const view = this.app.workspace.getActiveViewOfType(EpubView);
-        if (!view) return false;
-        if (!checking) view.toggleBookmarkOnCurrentPage();
-        return true;
-      },
-    });
-
-    this.addCommand({
-      id: "open-table-of-contents",
-      name: "Открыть оглавление, закладки, слова и поиск",
-      checkCallback: (checking: boolean) => {
-        const view = this.app.workspace.getActiveViewOfType(EpubView);
-        if (!view) return false;
-        if (!checking) void view.openToc();
-        return true;
-      },
-    });
-
-    this.addCommand({
       id: "jump-to-book-page",
       name: "Перейти к странице или проценту книги",
       checkCallback: (checking: boolean) => {

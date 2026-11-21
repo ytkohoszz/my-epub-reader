@@ -1,5 +1,4 @@
 import { App, Notice, PluginSettingTab, Setting } from "obsidian";
-import type { BookmarkItem } from "./highlights";
 import type MyEpubPlugin from "./main";
 
 export const VIEW_TYPE = "my-epub-view";
@@ -95,9 +94,9 @@ export interface Settings {
   barPosition?: BarPosition;
   spreadMode?: SpreadMode;
   desktopWidthPct?: number;
-  locationsCache?: Record<string, LegacyLocationCacheEntry>;
-  bookmarks?: Record<string, BookmarkItem[]>;
-booksFolder?: string;
+locationsCache?: Record<string, LegacyLocationCacheEntry>;
+  bookmarks?: Record<string, unknown[]>;
+  booksFolder?: string;
   wordsFilePath?: string;
   quotesFilePath?: string;
   autoSpeakOnTranslate?: boolean;
