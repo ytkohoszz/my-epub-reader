@@ -73,6 +73,14 @@ export const encodeInline = (s: string) =>
 const decodeInline = (s: string) =>
   String(s ?? "").replace(/⟩/g, ")").replace(/⟨/g, "(").trim();
 
+// Удаляем опциональные [id]-ассерты из EPUB CFI, чтобы ссылка не ломала синтаксис [[...]]
+export function sanitizeCfiForLink(cfi: string | null | undefined): string {
+  if (!cfi) return "";
+  const stripped = cfi.trim().replace(/\[(?:[^\]^]|\^.)*\]/g, "");
+  if (!stripped.startsWith("epubcfi(") || /[\[\]|#]/.test(stripped)) return "";
+  return stripped;
+}
+
 export function getTodayISO(): string {
   const d = new Date();
   const y = d.getFullYear();
@@ -1272,8 +1280,7 @@ export class AddWordModal extends Modal {
         const front = en;
         let backWithSource = ru;
         if (chosenBook) {
-          const cleanCfi =
-            this.capturedCfi && !/[\[\]|#]/.test(this.capturedCfi) ? this.capturedCfi.trim() : "";
+          const cleanCfi = sanitizeCfiForLink(this.capturedCfi);
           const wiki = cleanCfi
             ? `[[${chosenBook.fileName}#${cleanCfi}|${chosenBook.fileName}]]`
             : `[[${chosenBook.fileName}]]`;
@@ -1515,8 +1522,9 @@ export class AddQuoteModal extends Modal {
         const cleanLink = encodeInline(`[[${chosenBook.path}]]`);
         const cleanTitle = encodeInline(chosenBook.title);
         const cleanText = encodeInline(textVal);
-        const posPart = this.capturedCfi
-          ? ` (позиция:: ${encodeInline(this.capturedCfi)})`
+        const cleanQuoteCfi = sanitizeCfiForLink(this.capturedCfi) || this.capturedCfi?.trim() || "";
+        const posPart = cleanQuoteCfi
+          ? ` (позиция:: ${encodeInline(cleanQuoteCfi)})`
           : "";
 
         const entryLine = `\n- (категория:: Книга) (книга_ссылка:: ${cleanLink}) (книга:: ${cleanTitle}) (дата:: ${todayISO})${posPart} (цитата:: ${cleanText})`;

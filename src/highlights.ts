@@ -125,7 +125,7 @@ export async function loadBookAnnotationsFromVault(
   const wordsFile = resolveVaultFile(app, resolvedWordsPath);
   if (wordsFile) {
     try {
-      const content = await app.vault.cachedRead(wordsFile);
+      const content = await app.vault.read(wordsFile);
       const lines = content.split(/\r?\n/);
       for (let i = 0; i < lines.length; i++) {
         const line = lines[i] ?? "";
@@ -180,7 +180,7 @@ export async function loadBookAnnotationsFromVault(
 const quotesFile = resolveVaultFile(app, resolvedQuotesPath);
   if (quotesFile) {
     try {
-      const content = await app.vault.cachedRead(quotesFile);
+      const content = await app.vault.read(quotesFile);
       const lines = content.split(/\r?\n/);
       for (let i = 0; i < lines.length; i++) {
         const line = (lines[i] ?? "").trim();

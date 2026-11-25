@@ -72,11 +72,18 @@ export function saveCapturedText(
   const cleanedQuote = cleanSelectedQuote(raw);
   if (!cleanedWord && !cleanedQuote) return;
 
+  const isSameSelection =
+    cleanedWord === view.capturedWord && cleanedQuote === view.capturedQuote;
+  const prevRangeCfi =
+    isSameSelection && view.capturedCfi && view.capturedCfi.includes(",")
+      ? view.capturedCfi
+      : null;
+
   view.recordReadingActivity();
   view.capturedWord = cleanedWord;
   view.capturedQuote = cleanedQuote;
   view.lastSelectionAt = Date.now();
-  view.capturedCfi = view.stableCfi;
+  view.capturedCfi = prevRangeCfi ?? view.stableCfi;
 
   if (cfiOverride) {
     view.capturedCfi = cfiOverride;
@@ -91,7 +98,7 @@ export function saveCapturedText(
       const computedCfi = contentsObj.cfiFromRange(range);
       if (computedCfi) view.capturedCfi = computedCfi;
     } catch {
-      view.capturedCfi = view.stableCfi;
+      view.capturedCfi = prevRangeCfi ?? view.stableCfi;
     }
   }
 
