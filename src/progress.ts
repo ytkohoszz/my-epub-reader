@@ -1,4 +1,4 @@
-import { TFile } from "obsidian";
+import { App, TFile } from "obsidian";
 import { toNavigationCfi } from "./navigation";
 import { NavItem } from "epubjs";
 import { getTodayISO } from "./modals";
@@ -8,8 +8,210 @@ import {
   EpubRelocatedEvent,
   EpubRenditionExtended,
   READING_IDLE_PAUSE_MS,
+  READING_LOG_PATH,
+  READING_LOG_RETENTION_DAYS,
 } from "./settings";
 import type { EpubView } from "./view";
+
+interface ReadingLogBookEntry {
+  startPage: number;
+  maxPage: number;
+  creditedPages: number;
+}
+
+interface ReadingLogData {
+  version: 1;
+  days: Record<string, Record<string, ReadingLogBookEntry>>;
+}
+
+const RU_MONTHS = [
+  "январь",
+  "февраль",
+  "март",
+  "апрель",
+  "май",
+  "июнь",
+  "июль",
+  "август",
+  "сентябрь",
+  "октябрь",
+  "ноябрь",
+  "декабрь",
+];
+
+function buildDailyNotePath(diaryFolder: string, dateISO: string): string {
+  const cleanRoot = diaryFolder.replace(/^\/+|\/+$/g, "") || "Ежедневник";
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateISO);
+  if (!match) return `${cleanRoot}/${dateISO}.md`;
+  const year = match[1];
+  const monthStr = match[2];
+  const monthName = RU_MONTHS[Number(monthStr) - 1];
+  if (!monthName) return `${cleanRoot}/${dateISO}.md`;
+  return `${cleanRoot}/${year}/${monthStr} - ${monthName}/${dateISO}.md`;
+}
+
+async function ensureVaultFolder(app: App, folderPath: string): Promise<void> {
+  const parts = folderPath.split("/").filter(Boolean);
+  let current = "";
+  for (const part of parts) {
+    current = current ? `${current}/${part}` : part;
+    if (!app.vault.getAbstractFileByPath(current)) {
+      try {
+        await app.vault.createFolder(current);
+      } catch {
+        // Папка могла уже существовать на диске
+      }
+    }
+  }
+}
+
+async function findOrCreateDailyNote(
+  app: App,
+  diaryFolder: string,
+  dateISO: string
+): Promise<TFile> {
+  const cleanRoot = diaryFolder.replace(/^\/+|\/+$/g, "") || "Ежедневник";
+  const nestedPath = buildDailyNotePath(cleanRoot, dateISO);
+
+  const exactNested = app.vault.getAbstractFileByPath(nestedPath);
+  if (exactNested instanceof TFile) return exactNested;
+
+  const flatPath = `${cleanRoot}/${dateISO}.md`;
+  const exactFlat = app.vault.getAbstractFileByPath(flatPath);
+  if (exactFlat instanceof TFile) return exactFlat;
+
+  const prefix = `${cleanRoot}/`;
+  const existing = app.vault
+    .getMarkdownFiles()
+    .find((f) => f.path.startsWith(prefix) && f.basename === dateISO);
+  if (existing) return existing;
+
+  const lastSlash = nestedPath.lastIndexOf("/");
+  if (lastSlash > 0) {
+    await ensureVaultFolder(app, nestedPath.slice(0, lastSlash));
+  }
+
+  const initialContent = `---\nдата: ${dateISO}\n---\n`;
+  try {
+    return await app.vault.create(nestedPath, initialContent);
+  } catch {
+    const fallback = app.vault.getAbstractFileByPath(nestedPath);
+    if (fallback instanceof TFile) return fallback;
+    throw new Error(`Не удалось создать заметку дня: ${nestedPath}`);
+  }
+}
+
+async function loadReadingLog(app: App): Promise<ReadingLogData> {
+  const adapter = app.vault.adapter;
+  try {
+    if (await adapter.exists(READING_LOG_PATH)) {
+      const raw = await adapter.read(READING_LOG_PATH);
+      const parsed: unknown = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && "days" in parsed) {
+        const days = (parsed as Partial<ReadingLogData>).days;
+        if (days && typeof days === "object") {
+          return { version: 1, days };
+        }
+      }
+    }
+  } catch {
+    // Повреждённый JSON — пересоздаём чистый лог
+  }
+  return { version: 1, days: {} };
+}
+
+function pruneReadingLog(log: ReadingLogData, todayISO: string) {
+  const dateKeys = Object.keys(log.days).sort();
+  if (dateKeys.length <= READING_LOG_RETENTION_DAYS) return;
+  const toDrop = dateKeys.slice(0, dateKeys.length - READING_LOG_RETENTION_DAYS);
+  for (const key of toDrop) {
+    if (key !== todayISO) delete log.days[key];
+  }
+}
+
+async function saveReadingLog(app: App, log: ReadingLogData, todayISO: string): Promise<void> {
+  pruneReadingLog(log, todayISO);
+  const adapter = app.vault.adapter;
+  const dirEnd = READING_LOG_PATH.lastIndexOf("/");
+  if (dirEnd > 0) {
+    const dir = READING_LOG_PATH.slice(0, dirEnd);
+    if (!(await adapter.exists(dir))) {
+      await adapter.mkdir(dir);
+    }
+  }
+  await adapter.write(READING_LOG_PATH, JSON.stringify(log, null, 2));
+}
+
+async function syncDailyReadingPages(
+  view: EpubView,
+  bookKey: string,
+  todayISO: string,
+  prevYamlPage: number | null,
+  currentPage: number
+): Promise<void> {
+  if (!Number.isFinite(currentPage) || currentPage <= 0) return;
+
+  await view.plugin.enqueueReadingLogTask(async () => {
+    const log = await loadReadingLog(view.app);
+    const dayBucket = (log.days[todayISO] ??= {});
+    const existing = dayBucket[bookKey];
+
+    // Для новой книги (prevYamlPage отсутствует или <= 0) базой дня считаем текущую страницу,
+    // чтобы само открытие книги на стр. 1 не засчитывалось как прочитанная страница.
+    const startPage =
+      existing && Number.isFinite(existing.startPage) && existing.startPage > 0
+        ? existing.startPage
+        : prevYamlPage !== null && prevYamlPage > 0
+          ? prevYamlPage
+          : currentPage;
+
+    const prevMax =
+      existing && Number.isFinite(existing.maxPage) && existing.maxPage > 0
+        ? existing.maxPage
+        : startPage;
+
+    const prevCredited =
+      existing && Number.isFinite(existing.creditedPages) && existing.creditedPages >= 0
+        ? existing.creditedPages
+        : 0;
+
+    const nextMax = Math.max(prevMax, currentPage);
+    const targetCredited = Math.max(0, nextMax - startPage);
+    const deltaPages = Math.max(0, targetCredited - prevCredited);
+
+    const logChanged =
+      !existing ||
+      existing.startPage !== startPage ||
+      existing.maxPage !== nextMax ||
+      existing.creditedPages !== prevCredited + deltaPages;
+
+    if (!logChanged && deltaPages === 0) return;
+
+    if (deltaPages > 0) {
+      const diaryFolder = view.plugin.settings.diaryFolder || "Ежедневник";
+      const dailyFile = await findOrCreateDailyNote(view.app, diaryFolder, todayISO);
+      await view.app.fileManager.processFrontMatter(
+        dailyFile,
+        (fm: Record<string, unknown>) => {
+          const rawCur = fm["страниц_прочитано"];
+          const parsedCur = Number(rawCur);
+          const basePages =
+            Number.isFinite(parsedCur) && parsedCur > 0 ? Math.round(parsedCur) : 0;
+          fm["страниц_прочитано"] = basePages + deltaPages;
+          fm["чтение"] = true;
+        }
+      );
+    }
+
+    dayBucket[bookKey] = {
+      startPage,
+      maxPage: nextMax,
+      creditedPages: prevCredited + deltaPages,
+    };
+
+    await saveReadingLog(view.app, log, todayISO);
+  });
+}
 
 export function formatDurationMinutes(minutesFloat: number): string {
   const mins = Math.max(1, Math.round(minutesFloat));
@@ -474,8 +676,18 @@ export async function flushBookYamlProgress(view: EpubView) {
     view.unsavedReadingSeconds -= addedReadingMinutes * 60;
   }
 
+  let prevYamlPage: number | null = null;
+
   try {
     await view.app.fileManager.processFrontMatter(noteFile, (fm: Record<string, unknown>) => {
+      const rawPrev = fm["прочитано"];
+      if (rawPrev !== undefined && rawPrev !== null && String(rawPrev).trim() !== "") {
+        const parsedPrev = Math.round(Number(rawPrev));
+        if (Number.isFinite(parsedPrev) && parsedPrev > 0) {
+          prevYamlPage = parsedPrev;
+        }
+      }
+
       if (totalNum !== null && totalNum > 0 && fm["страниц"] !== totalNum) {
         fm["страниц"] = totalNum;
       }
@@ -512,5 +724,14 @@ export async function flushBookYamlProgress(view: EpubView) {
     }
     view.pendingYamlSync = true;
     console.error("MyEpubPlugin error syncing YAML frontmatter:", e);
+    return;
+  }
+
+  if (pageNum !== null && pageNum > 0) {
+    try {
+      await syncDailyReadingPages(view, noteFile.path, todayISO, prevYamlPage, pageNum);
+    } catch (e) {
+      console.error("MyEpubPlugin error syncing daily reading pages:", e);
+    }
   }
 }

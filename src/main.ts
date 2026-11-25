@@ -21,6 +21,7 @@ export default class MyEpubPlugin extends Plugin {
   private dirty = false;
   private settingsRevision = 0;
   private settingsWriteQueue: Promise<void> = Promise.resolve();
+  private readingLogQueue: Promise<void> = Promise.resolve();
   private locationsIndex: Record<string, LocationIndexMeta> = {};
 
   async onload() {
@@ -301,6 +302,15 @@ this.addCommand({
     }
     this.settings.progressUpdatedAt[filePath] = isoTime;
     this.requestSaveSettings();
+  }
+
+  enqueueReadingLogTask<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.readingLogQueue.then(task, task);
+    this.readingLogQueue = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
   }
 
   async onExternalSettingsChange() {

@@ -7,6 +7,8 @@ export const YAML_SYNC_DEBOUNCE_MS = 2000;
 export const SELECTION_THROTTLE_MS = 120;
 export const READING_IDLE_PAUSE_MS = 120_000;
 export const READING_TICK_INTERVAL_MS = 15_000;
+export const READING_LOG_PATH = "_system/reading-log.json";
+export const READING_LOG_RETENTION_DAYS = 90;
 
 export type ThemeMode = "auto" | "sepia" | "night";
 export type FontFamily = "default" | "serif" | "sans" | "mono";
@@ -97,6 +99,7 @@ export interface Settings {
 locationsCache?: Record<string, LegacyLocationCacheEntry>;
   bookmarks?: Record<string, unknown[]>;
   booksFolder?: string;
+  diaryFolder?: string;
   wordsFilePath?: string;
   quotesFilePath?: string;
   autoSpeakOnTranslate?: boolean;
@@ -118,6 +121,7 @@ export const DEFAULTS: Settings = {
   desktopWidthPct: 85,
   bookmarks: {},
 booksFolder: "Знания/Книги",
+  diaryFolder: "Ежедневник",
   wordsFilePath: "Words Cards",
   quotesFilePath: "Знания/Цитаты из книг.md",
   autoSpeakOnTranslate: false,
@@ -144,6 +148,7 @@ export function migrateSettings(raw: unknown): Settings {
   if (typeof s.fontSize !== "number" || isNaN(s.fontSize)) s.fontSize = DEFAULTS.fontSize;
   if (!s.bookmarks || typeof s.bookmarks !== "object") s.bookmarks = {};
   if (!s.booksFolder || typeof s.booksFolder !== "string") s.booksFolder = DEFAULTS.booksFolder;
+  if (!s.diaryFolder || typeof s.diaryFolder !== "string") s.diaryFolder = DEFAULTS.diaryFolder;
   if (!s.wordsFilePath || typeof s.wordsFilePath !== "string") s.wordsFilePath = DEFAULTS.wordsFilePath;
   if (!s.quotesFilePath || typeof s.quotesFilePath !== "string") s.quotesFilePath = DEFAULTS.quotesFilePath;
   if (s.spreadMode !== "auto" && s.spreadMode !== "none") s.spreadMode = "none";
@@ -190,6 +195,19 @@ export class EpubSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.booksFolder ?? "Знания/Книги")
           .onChange((val) => {
             this.plugin.settings.booksFolder = val.trim() || "Знания/Книги";
+            this.plugin.requestSaveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Папка ежедневника")
+      .setDesc("Корневая папка ежедневных заметок для записи прочитанных страниц (по умолчанию: Ежедневник)")
+      .addText((text) =>
+        text
+          .setPlaceholder("Ежедневник")
+          .setValue(this.plugin.settings.diaryFolder ?? "Ежедневник")
+          .onChange((val) => {
+            this.plugin.settings.diaryFolder = val.trim() || "Ежедневник";
             this.plugin.requestSaveSettings();
           })
       );
